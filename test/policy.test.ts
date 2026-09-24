@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { decideCompletion, decideDirection, margin } from "../src/policy.ts";
+import { decideCompletion, decideDirection, margin, repeatedFailureFocus } from "../src/policy.ts";
 import { defaultConfig, type SupervisorConfig } from "../src/config.ts";
 import { buildSnapshot, type Msg } from "../src/evidence.ts";
-import type { Answer, Assessment, DeterministicFact, Requirement } from "../src/types.ts";
+import type { Answer, Assessment, DeterministicFact, EvidenceSnapshot, Requirement } from "../src/types.ts";
 
 /**
  * Policy regressions for the reported adverse cases: weak MET must not buy a
@@ -14,6 +14,13 @@ import type { Answer, Assessment, DeterministicFact, Requirement } from "../src/
 
 function config(): SupervisorConfig {
 	return defaultConfig();
+}
+
+/** The total per-task cap now defaults to null (unlimited); cap tests set it. */
+function cappedConfig(maxInterventionsPerTask: number): SupervisorConfig {
+	const cfg = defaultConfig();
+	cfg.limits.maxInterventionsPerTask = maxInterventionsPerTask;
+	return cfg;
 }
 
 function snapshot(requirements: Requirement[], facts: DeterministicFact[] = [], truncated = false) {
@@ -244,7 +251,8 @@ test("terminal continuation budget and the total per-task intervention budget bo
 		kind: "completion" as const,
 		assessment: assessment({ requirement_R1: choice([0.05, 0.9, 0.03, 0.02], "UNMET"), final_claims_supported: yes(0.95), next_step: ns({ EXECUTE: 0.9, COMPLETE: 0.05, RESEARCH: 0.02, REPLAN: 0.01, VERIFY: 0.01, NEEDS_USER_INPUT: 0.005, BLOCKED: 0.005, UNCERTAIN: 0.0 }, "EXECUTE") }),
 		snapshot: snapshot(REQ),
-		config: config(),
+		// The default cap is null (unlimited), so a cap test must set it.
+		config: cappedConfig(3),
 	};
 	const atTerminalCap = decideCompletion({ ...inputs, counters: { ...counters, terminalContinuationsUsed: 2 } });
 	assert.equal(atTerminalCap.apply, "none");
@@ -329,6 +337,25 @@ test("direction: strong redirect with actionable focus blocks; weak signals pass
 		}),
 	});
 	assert.equal(weakFocus.apply, "none", "a mode alone is not grounds to block; focus must be actionable");
+	assert.equal(weakFocus.status, "UNRESOLVED", "no actionable focus is unresolved, never an executed verdict");
+	assert.ok(weakFocus.reasons.some((r) => r.includes("no_actionable_focus")), weakFocus.reasons.join(";"));
+});
+
+test("direction: a weak corrective next_step is UNRESOLVED, not EXECUTE (weak_support)", () => {
+	const decision = decideDirection({
+		kind: "direction",
+		assessment: assessment({
+			next_step: ns({ RESEARCH: 0.55, PROCEED: 0.30, REPLAN: 0.10, VERIFY: 0.03, UNCERTAIN: 0.02 }, "RESEARCH"),
+			unproductive_repeat: { type: "noul", questionId: "unproductive_repeat", noul: 0.1 },
+			focus_requirement: ns({ R1: 0.9, R2: 0.05, NONE: 0.03, UNKNOWN: 0.02 }, "R1"),
+		}),
+		snapshot: snapshot(REQ),
+		config: config(),
+		counters,
+	});
+	assert.equal(decision.apply, "none");
+	assert.equal(decision.status, "UNRESOLVED", "thin support for a redirect is not evidence that executing is right");
+	assert.ok(decision.reasons.some((r) => r.includes("weak_support")), decision.reasons.join(";"));
 });
 
 test("direction: intervention budget reached leaves the batch unsupervised rather than escalating", () => {
@@ -340,7 +367,7 @@ test("direction: intervention budget reached leaves the batch unsupervised rathe
 			focus_requirement: ns({ R1: 0.9, R2: 0.05, NONE: 0.03, UNKNOWN: 0.02 }, "R1"),
 		}),
 		snapshot: snapshot(REQ),
-		config: config(),
+		config: cappedConfig(3),
 		counters: { ...counters, interventionsUsed: 3 },
 	});
 	assert.equal(decision.apply, "none");
@@ -363,4 +390,146 @@ test("direction: the same focus and mode without new evidence is suppressed", ()
 	const repeat = decideDirection({ ...inputs, counters: { ...counters, interventionsUsed: 1, lastFocusKey: first.focusKey, newEvidence: false } });
 	assert.equal(repeat.apply, "none");
 	assert.ok(repeat.reasons.some((r) => r.includes("suppressing the repeat")));
+});
+
+// -------------------------------------------------- repeated-failure focus
+
+/**
+ * A snapshot whose executed path shows the SAME call (identical arguments) failing
+ * twice, plus a proposal that repeats exactly that call. `proposalArgs` lets a
+ * test vary the current proposal while keeping the failure history identical.
+ */
+function repeatSnapshot(proposalArgs: Record<string, unknown> = { path: "a.txt", text: "v1" }): ReturnType<typeof snapshot> {
+	const failedCall = (id: string) => assistantTurn(`run ${id}`, [{ id, name: "write", arguments: proposalArgs }]);
+	const messages: Msg[] = [];
+	// Two older results outside the six-observation window: they must not trigger.
+	messages.push(failedCall("c-old-1"), toolResult("c-old-1", "old failure", { isError: true, toolName: "write" }));
+	messages.push(failedCall("c-old-2"), toolResult("c-old-2", "old failure", { isError: true, toolName: "write" }));
+	// The six executed observations that matter: E3..E8 in the snapshot.
+	const recent = [
+		["c1", false], ["c2", true], ["c3", false], ["c4", true], ["c5", false], ["c6", true],
+	] as const;
+	for (const [id, ok] of recent) {
+		messages.push(failedCall(id), toolResult(id, ok ? "ok" : "failed", { isError: !ok, toolName: "write" }));
+	}
+	const target = assistant("same write again", [{ id: "c7", name: "write", arguments: proposalArgs }], "toolUse");
+	messages.push(target);
+	return buildSnapshot({
+		kind: "proposal",
+		target,
+		messages,
+		executedToolCallIds: new Set(["c-old-1", "c-old-2", "c1", "c2", "c3", "c4", "c5", "c6"]),
+		requirements: REQ,
+		manifest: false,
+		priorInterventions: [],
+		config: config(),
+		secrets: [],
+		scope: { sessionId: "s", taskId: "t", branch: "main" },
+	});
+}
+
+function assistantTurn(text: string, calls: Array<{ id: string; name: string; arguments: Record<string, unknown> }>): Msg {
+	return { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text }, ...calls.map((c) => ({ type: "toolCall", id: c.id, name: c.name, arguments: c.arguments }))] };
+}
+
+/** An assistant turn; `calls` may be empty for a terminal text message. */
+function assistant(text: string, calls: Array<{ id: string; name: string; arguments: Record<string, unknown> }> = [], stopReason = "toolUse"): Msg {
+	return assistantTurn(text, calls.map((call) => ({ id: call.id, name: call.name, arguments: call.arguments })));
+}
+
+function toolResult(toolCallId: string, text: string, opts: { isError?: boolean; toolName?: string }): Msg {
+	return { role: "toolResult", toolCallId, toolName: opts.toolName ?? "bash", isError: opts.isError ?? false, content: [{ type: "text", text }] };
+}
+
+const STRONG_RESEARCH = ns({ RESEARCH: 0.9, PROCEED: 0.05, REPLAN: 0.02, VERIFY: 0.02, UNCERTAIN: 0.01 }, "RESEARCH");
+const NO_FOCUS = ns({ NONE: 0.7, UNKNOWN: 0.2, R1: 0.1 }, "NONE");
+
+test("repeated failure: strong corrective + no focus + measured identical failures blocks with cited evidence", () => {
+	const snap = repeatSnapshot();
+	const decision = decideDirection({
+		kind: "direction",
+		assessment: assessment({ next_step: STRONG_RESEARCH, unproductive_repeat: { type: "noul", questionId: "unproductive_repeat", noul: 0.9 }, focus_requirement: NO_FOCUS }),
+		snapshot: snap,
+		config: config(),
+		counters,
+	});
+	assert.equal(decision.apply, "block", "the repeated failure is a measured fact, so it is a legitimate focus");
+	assert.equal(decision.status, "RESEARCH");
+	assert.ok(decision.reasons.some((r) => r.includes("repeated_failure_focus")), decision.reasons.join(";"));
+	assert.ok(decision.memo!.includes("E") && /\bE\d/.test(decision.memo!), `the memo must cite evidence ids: ${decision.memo}`);
+	assert.ok(!/because\b.*because/.test(decision.memo!), "no invented causal story");
+});
+
+test("repeated failure: never fires on the repetition diagnostic alone (no measured failures)", () => {
+	const decision = decideDirection({
+		kind: "direction",
+		assessment: assessment({ next_step: STRONG_RESEARCH, unproductive_repeat: { type: "noul", questionId: "unproductive_repeat", noul: 0.97 }, focus_requirement: NO_FOCUS }),
+		snapshot: snapshot(REQ),
+		config: config(),
+		counters,
+	});
+	assert.equal(decision.apply, "none");
+	assert.equal(decision.status, "UNRESOLVED");
+	assert.ok(decision.reasons.some((r) => r.includes("no_actionable_focus")), decision.reasons.join(";"));
+});
+
+test("repeated failure: a proposal that changes the arguments is not a repeat", () => {
+	const changed = repeatSnapshot({ path: "a.txt", text: "v1" });
+	const decision = decideDirection({
+		kind: "direction",
+		assessment: assessment({ next_step: STRONG_RESEARCH, unproductive_repeat: { type: "noul", questionId: "unproductive_repeat", noul: 0.9 }, focus_requirement: NO_FOCUS }),
+		snapshot: changedWithDifferentArgs(changed),
+		config: config(),
+		counters,
+	});
+	assert.equal(decision.apply, "none", "changed arguments are a changed approach, not a repeated failure");
+	assert.equal(decision.status, "UNRESOLVED");
+});
+
+/** Same evidence, but the current proposal calls the tool with different arguments. */
+function changedWithDifferentArgs(snap: EvidenceSnapshot): EvidenceSnapshot {
+	const args = { path: "a.txt", text: "materially different approach" };
+	const call = { id: "c7", name: "write", arguments: args, argsHash: hashJsonForTest(args) };
+	return { ...snap, toolCalls: [call] };
+}
+
+function hashJsonForTest(value: unknown): string {
+	// Any value distinct from the failed calls' hash is enough: policy compares hashes.
+	return `different-hash:${JSON.stringify(value).length}`;
+}
+
+test("repeated failure: below the diagnostic threshold the measured repeat still does not fire", () => {
+	const decision = decideDirection({
+		kind: "direction",
+		assessment: assessment({ next_step: STRONG_RESEARCH, unproductive_repeat: { type: "noul", questionId: "unproductive_repeat", noul: 0.84 }, focus_requirement: NO_FOCUS }),
+		snapshot: repeatSnapshot(),
+		config: config(),
+		counters,
+	});
+	assert.equal(decision.apply, "none");
+	assert.ok(decision.reasons.some((r) => r.includes("no_actionable_focus")), decision.reasons.join(";"));
+});
+
+test("repeated failure: a strong PROCEED is never overridden by repetition", () => {
+	const decision = decideDirection({
+		kind: "direction",
+		assessment: assessment({
+			next_step: ns({ PROCEED: 0.9, RESEARCH: 0.05, REPLAN: 0.03, VERIFY: 0.01, UNCERTAIN: 0.01 }, "PROCEED"),
+			unproductive_repeat: { type: "noul", questionId: "unproductive_repeat", noul: 0.99 },
+			focus_requirement: NO_FOCUS,
+		}),
+		snapshot: repeatSnapshot(),
+		config: config(),
+		counters,
+	});
+	assert.equal(decision.apply, "none");
+	assert.equal(decision.status, "EXECUTE", "PROCEED plus a high repeat score is still a pass-through");
+	assert.ok(decision.reasons.some((r) => r.includes("repeat_never_vetoes_proceed")), decision.reasons.join(";"));
+});
+
+test("repeated failure: the detector requires executed failures with identical args", () => {
+	const snap = repeatSnapshot();
+	assert.ok(repeatedFailureFocus(snap, config(), 0.9), "the fixture itself must contain the measured repeat");
+	assert.equal(repeatedFailureFocus(snap, config(), 0.5), null, "the diagnostic threshold is required");
+	assert.equal(repeatedFailureFocus(snapshot(REQ), config(), 0.9), null, "no executed failures, no fallback");
 });

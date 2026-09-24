@@ -91,7 +91,7 @@ export function decideDirection(input: PolicyInput): Decision {
 	}
 	if (nextStep.selected === "PROCEED") {
 		// A high repetition score is recorded but never vetoes a PROCEED on its own.
-		return { assessment, apply: "none", status: "EXECUTE", reasons: [...reasons, `next_step=PROCEED (p=${nextStep.probability.toFixed(3)}, gap=${nextStep.gap.toFixed(3)})`], memo: null, focusKey: null };
+		return { assessment, apply: "none", status: "EXECUTE", reasons: [...reasons, `next_step=PROCEED (p=${nextStep.probability.toFixed(3)}, gap=${nextStep.gap.toFixed(3)})`, "repeat_never_vetoes_proceed: the repetition diagnostic alone is never grounds to block"], memo: null, focusKey: null };
 	}
 	if (!REDIRECT_MODES.includes(nextStep.selected as (typeof REDIRECT_MODES)[number])) {
 		return { assessment, apply: "none", status: "UNRESOLVED", reasons: [`unexpected next_step ${nextStep.selected}`], memo: null, focusKey: null };
@@ -100,25 +100,31 @@ export function decideDirection(input: PolicyInput): Decision {
 		return {
 			assessment,
 			apply: "none",
-			status: "EXECUTE",
-			reasons: [...reasons, `next_step=${nextStep.selected} but support is below policy (p=${nextStep.probability.toFixed(3)} needs >=${config.policy.probabilityThreshold}, gap=${nextStep.gap.toFixed(3)} needs >=${config.policy.gapThreshold})`],
+			status: "UNRESOLVED",
+			reasons: [...reasons, `weak_support: next_step=${nextStep.selected} is below policy (p=${nextStep.probability.toFixed(3)} needs >=${config.policy.probabilityThreshold}, gap=${nextStep.gap.toFixed(3)} needs >=${config.policy.gapThreshold}); an unresolved verdict, not a licence to execute the assessed step`],
 			memo: null,
 			focusKey: null,
 		};
 	}
+	// The one measured fact that can stand in for an unlocatable requirement: the
+	// executed path already shows this same action failing repeatedly. That is an
+	// observation, not an invented focus, so it is allowed as a focus fallback.
+	const repeatedFailure = repeatedFailureFocus(snapshot, config, repeat);
 	if (POLICY_INVARIANTS.requireActionableFocus) {
 		if (focus === undefined || NON_VETO_OPTIONS.includes(focus.selected) || focus.probability < config.policy.probabilityThreshold) {
-			return {
-				assessment,
-				apply: "none",
-				status: "EXECUTE",
-				reasons: [...reasons, `no actionable requirement focus (focus_requirement=${focus?.selected ?? "missing"}, p=${(focus?.probability ?? 0).toFixed(3)}); a mode alone is not grounds to block`],
-				memo: null,
-				focusKey: null,
-			};
+			if (repeatedFailure === null) {
+				return {
+					assessment,
+					apply: "none",
+					status: "UNRESOLVED",
+					reasons: [...reasons, `no_actionable_focus: focus_requirement=${focus?.selected ?? "missing"} (p=${(focus?.probability ?? 0).toFixed(3)}) and no measured repeated failure; a mode alone is not grounds to block, and the step is not certified either`],
+					memo: null,
+					focusKey: null,
+				};
+			}
 		}
 	}
-	if (counters.interventionsUsed >= config.limits.maxInterventionsPerTask) {
+	if (config.limits.maxInterventionsPerTask !== null && counters.interventionsUsed >= config.limits.maxInterventionsPerTask) {
 		return {
 			assessment,
 			apply: "none",
@@ -128,7 +134,9 @@ export function decideDirection(input: PolicyInput): Decision {
 			focusKey: null,
 		};
 	}
-	const focusKey = `direction:${nextStep.selected}:${focus?.selected ?? "none"}`;
+	const focusKey = repeatedFailure === null
+		? `direction:${nextStep.selected}:${focus?.selected ?? "none"}`
+		: `direction:${nextStep.selected}:repeat:${repeatedFailure.toolName}:${repeatedFailure.argsHash.slice(0, 12)}`;
 	if (counters.lastFocusKey === focusKey && !counters.newEvidence) {
 		return {
 			assessment,
@@ -144,8 +152,12 @@ export function decideDirection(input: PolicyInput): Decision {
 		assessment,
 		apply: "block",
 		status: nextStep.selected as Decision["status"],
-		reasons: [...reasons, `next_step=${nextStep.selected} (p=${nextStep.probability.toFixed(3)}, gap=${nextStep.gap.toFixed(3)})`, `focus=${focus?.selected ?? "none"} (p=${(focus?.probability ?? 0).toFixed(3)})`],
-		memo: directionMemo(nextStep.selected as WorkMode, requirement, snapshot),
+		reasons: repeatedFailure === null
+			? [...reasons, `next_step=${nextStep.selected} (p=${nextStep.probability.toFixed(3)}, gap=${nextStep.gap.toFixed(3)})`, `focus=${focus?.selected ?? "none"} (p=${(focus?.probability ?? 0).toFixed(3)})`]
+			: [...reasons, `repeated_failure_focus: ${repeatedFailure.toolName} failed with identical arguments in ${repeatedFailure.evidenceIds.join(", ")} and this proposal repeats that exact call; no requirement-specific focus was identified`],
+		memo: repeatedFailure === null
+			? directionMemo(nextStep.selected as WorkMode, requirement, snapshot)
+			: repeatedFailureMemo(nextStep.selected as WorkMode, repeatedFailure, snapshot),
 		focusKey,
 	};
 }
@@ -286,7 +298,7 @@ export function decideCompletion(input: CompletionPolicyInput): Decision {
 		};
 	}
 	// Interventions of BOTH kinds count against the per-task budget.
-	if (counters.interventionsUsed >= config.limits.maxInterventionsPerTask) {
+	if (config.limits.maxInterventionsPerTask !== null && counters.interventionsUsed >= config.limits.maxInterventionsPerTask) {
 		return {
 			assessment,
 			apply: "none",
@@ -346,6 +358,63 @@ function factMatches(subject: string, requirement: Requirement): boolean {
 	const haystack = `${requirement.id} ${requirement.summary}`.toLowerCase();
 	const needle = subject.toLowerCase().trim();
 	return needle !== "" && needle !== "unknown" && haystack.includes(needle);
+}
+
+/**
+ * The only fallback focus policy accepts without an assessment-identified
+ * requirement: the SAME action, with byte-identical arguments, already failed on
+ * the executed path at least twice inside the last six executed observations,
+ * and the current proposal repeats exactly that call. Everything here is a
+ * runtime measurement (`provenance === "executed"`, tool name, argument hash,
+ * evidence ids); no cause is inferred, because the evidence does not establish one.
+ */
+export interface RepeatedFailure {
+	toolName: string;
+	argsHash: string;
+	evidenceIds: string[];
+}
+
+export function repeatedFailureFocus(
+	snapshot: EvidenceSnapshot,
+	config: SupervisorConfig,
+	repeat: number | undefined,
+	window = 6,
+	minFailures = 2,
+): RepeatedFailure | null {
+	// The repetition diagnostic is required as corroboration but is never the
+	// trigger on its own: without the measured failures below nothing fires.
+	if (repeat === undefined || repeat < config.policy.repeatDiagnosticThreshold) {
+		return null;
+	}
+	const executed = snapshot.observations.filter((observation) => observation.provenance === "executed");
+	const groups = new Map<string, RepeatedFailure>();
+	for (const observation of executed.slice(-window)) {
+		if (!observation.ok || observation.argsHash === undefined) {
+			continue;
+		}
+		const key = `${observation.toolName}\u0000${observation.argsHash}`;
+		const group = groups.get(key) ?? { toolName: observation.toolName, argsHash: observation.argsHash, evidenceIds: [] };
+		group.evidenceIds.push(observation.id);
+		groups.set(key, group);
+	}
+	const repeated = [...groups.values()]
+		.filter((group) => group.evidenceIds.length >= minFailures)
+		// The proposal must repeat the failing call itself, not merely resemble it.
+		.filter((group) => snapshot.toolCalls.some((call) => call.name === group.toolName && call.argsHash === group.argsHash))
+		.pop();
+	return repeated ?? null;
+}
+
+function repeatedFailureMemo(mode: WorkMode, failure: RepeatedFailure, snapshot: EvidenceSnapshot): string {
+	const ids = failure.evidenceIds.join(", ");
+	return [
+		`[Supervisor intervention: ${mode}]`,
+		`The proposed actions were not executed because this exact call has already failed on the executed path: \`${failure.toolName}\` returned errors in evidence ${ids}, and this proposal repeats it with identical arguments.`,
+		`No cause is asserted here; the supplied evidence does not establish one. Investigate the cited evidence (${ids}) and change the approach — different inputs, a different tool, or a diagnostic step — before proposing this call again.`,
+		`This decision came from an assessment of the supplied evidence; it is not a tool failure, a permission denial, or a safety judgement.`,
+		`Keep the original task and Pi's normal controls unchanged.`,
+		`Evidence revision: ${snapshot.scope.snapshotHash}`,
+	].join("\n");
 }
 
 function directionMemo(mode: WorkMode, requirement: Requirement | undefined, snapshot: EvidenceSnapshot): string {

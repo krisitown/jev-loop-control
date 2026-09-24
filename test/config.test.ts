@@ -24,6 +24,12 @@ test("defaults: mode enforce, live enabled, unlimited caps", () => {
 	assert.equal(base.budget.allowanceUsd, null);
 	assert.equal(base.budget.maxRequests, null);
 	assert.equal(base.limits.maxAssessments, null);
+	// Total interventions are unlimited by default; only terminal continuations
+	// and the local request guard stay bounded.
+	assert.equal(base.limits.maxInterventionsPerTask, null);
+	assert.equal(base.limits.maxTerminalContinuations, 2);
+	// 131072 is a local transport guard, not an asserted provider limit.
+	assert.equal(base.jev.maxRequestBytes, 131_072);
 
 	// An empty project with no config file is the default: enforce, valid if key present.
 	const result = loadConfig("/empty", { AI_GATEWAY_API_KEY: "synthetic-key" }, { read: () => { throw new Error("must not read"); }, exists: () => false });
@@ -138,6 +144,67 @@ test("budget validation: negative numbers rejected", () => {
 	assert.ok(r.problems.some((p) => p.includes("maxRequests") && p.includes("between")));
 	const r2 = load({ budget: { allowanceUsd: -0.1 } });
 	assert.ok(r2.problems.some((p) => p.includes("allowanceUsd") && p.includes("between")));
+});
+
+test("defaults with no config file: unlimited interventions and the 131072 request guard", () => {
+	const r = loadConfig("/empty", { AI_GATEWAY_API_KEY: "synthetic-key" }, { read: () => { throw new Error("must not read"); }, exists: () => false });
+	assert.deepEqual(r.problems, []);
+	assert.equal(r.config.limits.maxInterventionsPerTask, null);
+	assert.equal(r.config.limits.maxTerminalContinuations, 2);
+	assert.equal(r.config.jev.maxRequestBytes, 131_072);
+	assert.ok(JSON.stringify(describeConfig(r.config)).includes("131072"), "guard is visible in the redaction-safe summary");
+});
+
+test("limits.maxInterventionsPerTask: default null, explicit null/0/3 accepted", () => {
+	const absent = load({});
+	assert.deepEqual(absent.problems, []);
+	assert.equal(absent.config.limits.maxInterventionsPerTask, null, "omitted means unlimited, not an inherited cap");
+
+	for (const value of [null, 0, 3]) {
+		const r = load({ limits: { maxInterventionsPerTask: value } });
+		assert.deepEqual(r.problems, [], `expected ${JSON.stringify(value)} to be accepted: ${r.problems.join("; ")}`);
+		assert.equal(r.config.limits.maxInterventionsPerTask, value);
+	}
+
+	// An explicit cap is stored verbatim; it is a cap, not a target or a default.
+	// A config written before 0.2.0 keeps its 3 and still overrides the unlimited
+	// default: the upgrade lifts nothing silently.
+	const capped = load({ limits: { maxInterventionsPerTask: 3 } });
+	assert.equal(capped.config.limits.maxInterventionsPerTask, 3);
+	assert.equal(capped.config.limits.maxTerminalContinuations, 2, "a per-task cap never silently moves the continuation bound");
+});
+
+test("limits.maxInterventionsPerTask: malformed values are rejected and fall back to unlimited", () => {
+	for (const bad of ["3", true, [3], {}, 1.5, -1]) {
+		const r = load({ limits: { maxInterventionsPerTask: bad } });
+		assert.ok(r.problems.some((p) => p.includes("maxInterventionsPerTask")), `${JSON.stringify(bad)}: ${r.problems.join("; ")}`);
+		assert.equal(r.config.limits.maxInterventionsPerTask, null, "a rejected cap falls back to the unlimited default, never to a guessed number");
+	}
+
+	const echoed = load({ limits: { maxInterventionsPerTask: "hunter2-per-task" } });
+	assert.ok(!JSON.stringify(echoed.problems).includes("hunter2-per-task"), "diagnostics report shape only");
+});
+
+test("jev.maxRequestBytes: configurable local guard, bounded range, no provider claim", () => {
+	const raised = load({ jev: { maxRequestBytes: 262_144 } });
+	assert.deepEqual(raised.problems, []);
+	assert.equal(raised.config.jev.maxRequestBytes, 262_144);
+
+	const lowered = load({ jev: { maxRequestBytes: 1024 } });
+	assert.deepEqual(lowered.problems, []);
+	assert.equal(lowered.config.jev.maxRequestBytes, 1024);
+
+	const tooBig = load({ jev: { maxRequestBytes: 2_000_000 } });
+	assert.ok(tooBig.problems.some((p) => p.includes("maxRequestBytes") && p.includes("between")));
+	assert.equal(tooBig.config.jev.maxRequestBytes, 131_072);
+
+	const tooSmall = load({ jev: { maxRequestBytes: 16 } });
+	assert.ok(tooSmall.problems.some((p) => p.includes("maxRequestBytes") && p.includes("between")));
+
+	const wrongType = load({ jev: { maxRequestBytes: "131072" } });
+	assert.ok(wrongType.problems.some((p) => p.includes("maxRequestBytes") && p.includes("finite number")));
+	const echoed = load({ jev: { maxRequestBytes: "hunter2-bytes" } });
+	assert.ok(!JSON.stringify(echoed.problems).includes("hunter2-bytes"), "diagnostics report shape only");
 });
 
 test("limits.maxAssessments: explicit 0 and null are valid", () => {

@@ -37,6 +37,13 @@ export interface JevSection {
 	/** Total wall-clock deadline for one assessment, in ms. No retries. */
 	deadlineMs: number;
 	maxResponseBytes: number;
+	/**
+	 * Local transport guard: a serialized request larger than this is never put
+	 * on the wire, and the assessment fails as a transport problem instead.
+	 * Configurable, and deliberately NOT a claim about any provider's own limit:
+	 * raising it buys no additional provider allowance, it only widens what this
+	 * client is willing to send.
+	 */
 	maxRequestBytes: number;
 }
 
@@ -69,7 +76,8 @@ export const POLICY_INVARIANTS = Object.freeze({
 });
 
 export interface LimitSection {
-	maxInterventionsPerTask: number;
+	/** Hard cap on interventions per task. null means unlimited. */
+	maxInterventionsPerTask: number | null;
 	maxTerminalContinuations: number;
 	/** Hard cap on assessments per session. null means unlimited. */
 	maxAssessments: number | null;
@@ -77,7 +85,11 @@ export interface LimitSection {
 	proposalLease: number;
 	/** Character budget for the evidence block. */
 	maxEvidenceChars: number;
-	/** A proposal larger than this skips assessment and passes through. */
+	/**
+	 * Accepted and validated, but not consulted in this release: no code path
+	 * reads it yet. An oversized payload is currently caught by the request-size
+	 * guard instead. Kept in the schema so a config that sets it stays valid.
+	 */
 	maxProposalChars: number;
 }
 
@@ -125,7 +137,9 @@ export function defaultConfig(): SupervisorConfig {
 			apiKeyEnv: "AI_GATEWAY_API_KEY",
 			deadlineMs: 5000,
 			maxResponseBytes: 262_144,
-			maxRequestBytes: 49_152,
+			// Local guard only. Sized to carry a bounded evidence snapshot plus the
+			// proposal under review; not an asserted provider limit.
+			maxRequestBytes: 131_072,
 		},
 		budget: { maxRequests: null, allowanceUsd: null, reserveUsdPerRequest: 0.01 },
 		policy: {
@@ -134,7 +148,7 @@ export function defaultConfig(): SupervisorConfig {
 			repeatDiagnosticThreshold: 0.85,
 		},
 		limits: {
-			maxInterventionsPerTask: 3,
+			maxInterventionsPerTask: null,
 			maxTerminalContinuations: 2,
 			maxAssessments: null,
 			proposalLease: 2,
@@ -429,7 +443,7 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, io
 	if (limits) {
 		reader.checkKeys({ path: "limits", value: limits, allowed: ["maxInterventionsPerTask", "maxTerminalContinuations", "maxAssessments", "proposalLease", "maxEvidenceChars", "maxProposalChars"] });
 		config.limits = {
-			maxInterventionsPerTask: reader.number(limits, "limits", "maxInterventionsPerTask", base.limits.maxInterventionsPerTask, { min: 0, max: 100, integer: true }),
+			maxInterventionsPerTask: reader.nullableNumber(limits, "limits", "maxInterventionsPerTask", base.limits.maxInterventionsPerTask, { min: 0, max: 100, integer: true }),
 			maxTerminalContinuations: reader.number(limits, "limits", "maxTerminalContinuations", base.limits.maxTerminalContinuations, { min: 0, max: 100, integer: true }),
 			maxAssessments: reader.nullableNumber(limits, "limits", "maxAssessments", base.limits.maxAssessments, { min: 0, max: 1000, integer: true }),
 			proposalLease: reader.number(limits, "limits", "proposalLease", base.limits.proposalLease, { min: 1, max: 10, integer: true }),
@@ -509,6 +523,7 @@ export function describeConfig(config: SupervisorConfig): Record<string, unknown
 			apiKeyEnv: config.jev.apiKeyEnv,
 			deadlineMs: config.jev.deadlineMs,
 			maxResponseBytes: config.jev.maxResponseBytes,
+			maxRequestBytes: config.jev.maxRequestBytes,
 		},
 		budget: config.budget,
 		policy: config.policy,

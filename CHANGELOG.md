@@ -1,0 +1,51 @@
+# Changelog
+
+Notable changes to `jev-loop-control`. Entries describe shipped behaviour only.
+Measured experiment results are published separately once they are verified, so
+no entry here claims a quality improvement.
+
+## 0.2.0
+
+### Added
+
+- Recovery guidance in `enforce`: a blocked direction proposal can open a recovery
+  (`RESEARCH`, `REPLAN`, `VERIFY`, `EXECUTE`) with an explicit objective. The
+  objective is injected as a hidden guidance message and expires after 2 proposals
+  (`limits.proposalLease`). Expiry does not mean the objective was met.
+- Duplicate suppression: a recovery for the same focus and evidence is not reopened.
+  The drop is traced as `intervention.suppressed` instead of repeating guidance.
+- Bounded recent history in each snapshot: the last 12 tool results, plus the 2 most
+  recent errors that fall outside that window. `omitted_evidence_ids`,
+  `omitted_observation_count`, and `context_selection` state what was left out.
+- Status and trace detail: `/jev-status` reports `activeRecovery` and `lastFailure`;
+  traces record `recommendedApply` separately from `actualApply`, plus intervention
+  and continuation counters.
+
+### Changed
+
+- `limits.maxInterventionsPerTask` defaults to `null` (unlimited per task). Explicit
+  values, including `0`, are still enforced. `limits.maxTerminalContinuations`
+  remains 2, so an uncapped task still cannot continue itself forever.
+- `jev.maxRequestBytes` default raised from 49152 to 131072. This is a local transport
+  guard on what this client sends, not an asserted provider limit. Requests above the
+  guard fail as transport errors; there is no retry.
+- Budgets stay unlimited by default (`budget.maxRequests`, `budget.allowanceUsd`,
+  `limits.maxAssessments` all `null`).
+- Example config now shows `maxInterventionsPerTask: null` and `maxRequestBytes`.
+
+### Notes
+
+- The Pi model you configure remains the actor. Nothing in this release changes it.
+- Guidance state is held in memory for the session. Restoring it across restarts or
+  session replacement is deferred.
+- Evidence is a bounded view of the task trajectory, not the whole context.
+- Effect on output quality is not yet measured.
+
+## 0.1.0
+
+### Added
+
+- Initial release: `off` / `observe` / `enforce` modes, strict configuration validation
+  with fatal problems surfaced rather than swallowed, Jev assessment client with a
+  per-request deadline and size guards, redaction of credentials before storage, local
+  traces under the Pi agent directory, and the `/jev-status` and `/jev-trace` commands.

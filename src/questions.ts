@@ -131,7 +131,7 @@ export interface StateBuildInput {
 		workMode: string;
 		proposalNumber: number;
 		interventionsUsed: number;
-		interventionLimit: number;
+		interventionLimit: number | null;
 		previousInterventions: Array<{ kind: string; status: string; focus: string | null; at: string }>;
 	};
 	proposalId: string;

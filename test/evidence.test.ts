@@ -177,11 +177,17 @@ test("snapshot: omitted evidence ids are honest; redaction and truncation are di
 	assert.ok(!JSON.stringify(redacted.representation).includes("s3cr3t-key"), "no configured secret survives");
 	assert.ok(JSON.stringify(redacted.representation).includes("[REDACTED]"));
 
-	// Truncation is bounded history with the elision mark and truncated=true.
+	// Bounded HISTORY is context selection recorded on the history itself, with the
+	// elision mark. It is not a limitation of the current proposal, so the snapshot
+	// flag stays false (see steering-context.test.ts).
 	const longHistory = assistant("z".repeat(20000), [], "stop");
 	const truncatedSnap = build([longHistory, target], target, []);
-	assert.equal(truncatedSnap.truncated, true);
+	const historyMeta = truncatedSnap.representation.history as { text: string; truncated: boolean; chars: number };
+	assert.equal(historyMeta.truncated, true, "history bounds are reported on representation.history");
+	assert.equal(historyMeta.chars, 20000, "exact original character count, not the labeled rendering");
+	assert.equal(truncatedSnap.truncated, false, "bounded history never claims a truncated proposal");
 	assert.ok(truncatedSnap.actorText.includes("[ELIDED]") || truncatedSnap.actorText.includes("characters elided"));
+	assert.ok(truncatedSnap.actorText.endsWith("z".repeat(100)), "the MOST RECENT text is kept, not a prefix");
 });
 
 test("snapshot: identity hash covers the exact sanitized representation", () => {
@@ -191,6 +197,71 @@ test("snapshot: identity hash covers the exact sanitized representation", () => 
 	delete (rep as { snapshotHash?: string }).snapshotHash;
 	// The stored hash equals a hash of the representation itself (recomputable by an auditor).
 	assert.equal(snap.scope.snapshotHash, hashJson(rep));
+});
+
+test("snapshot: historical arguments are bounded to a 600-char summary, current proposal arguments stay full", () => {
+	const secretPayload = "q".repeat(4000);
+	const older = assistant("earlier", [{ id: "old-1", name: "write", arguments: { path: "a.ts", content: secretPayload } }]);
+	const olderResult = toolResult("old-1", "wrote a.ts");
+	const target = assistant("now", [{ id: "new-1", name: "write", arguments: { path: "b.ts", content: secretPayload } }]);
+	const snap = build([older, olderResult, target], target, ["old-1"]);
+
+	// The proposal's own arguments: complete, never summarized.
+	const proposalArgs = snap.toolCalls[0]!.arguments as { content: string };
+	assert.equal(proposalArgs.content.length, 4000, "the current proposal keeps full arguments");
+	assert.ok(JSON.stringify(snap.representation.proposal).includes(secretPayload), "and the representation carries them in full");
+
+	// The historical call: bounded summary, original hash retained.
+	const action = (snap.representation.recent_actions as Array<Record<string, any>>)[0]!;
+	assert.equal(action.arguments_truncated, true);
+	assert.ok(action.arguments._summary.length <= 600, `summary is bounded, got ${action.arguments._summary.length}`);
+	assert.ok(!JSON.stringify(action).includes(secretPayload), "the full historical payload is not sent twice");
+	assert.equal(action.arguments_chars, action.arguments._original_chars);
+	// The hash is of the ORIGINAL arguments, so a repeat is still detected exactly.
+	assert.equal(action.arguments_hash, hashJson({ path: "a.ts", content: secretPayload }));
+	assert.notEqual(action.arguments_hash, hashJson({ _summary: action.arguments._summary }));
+	assert.equal((snap.representation.context_selection as { arguments_truncated_count: number }).arguments_truncated_count, 1);
+});
+
+test("snapshot: result truncation metadata is keyed by evidence id, never by a redacted tool-call id", () => {
+	// The tool-call id itself carries the secret, so a lookup of the raw message by
+	// the REDACTED id would miss and report 0 chars for a 3000-char result.
+	const long = "r".repeat(3000);
+	const leakyId = "call-s3cr3t-key-1";
+	const messages = [assistant("run", [{ id: leakyId, name: "bash", arguments: { command: "make test" } }]), toolResult(leakyId, long)];
+	const target = assistant("done", [], "stop");
+	messages.push(target);
+	const snap = build(messages, target, [leakyId]);
+
+	const meta = (snap.representation.context_selection as { truncation_metadata: Array<Record<string, any>> }).truncation_metadata;
+	assert.equal(meta.length, snap.observations.length, "metadata covers exactly the retained observations");
+	assert.deepEqual(meta.map((entry) => entry.id), snap.observations.map((observation) => observation.id), "keyed by EID");
+	assert.equal(meta[0]!.truncated, true);
+	assert.equal(meta[0]!.originalChars, 3000, "raw length is known without looking the message up by redacted id");
+	assert.equal(meta[0]!.retainedChars, 2000, "retained text is exactly the stated bound");
+	assert.equal(snap.observations[0]!.text.length, 2000);
+	assert.ok(!JSON.stringify(snap.representation).includes("s3cr3t-key"), "the id is redacted everywhere");
+	assert.equal(meta[0]!.tool_call_id, "call-[REDACTED]-1");
+	assert.equal(snap.truncated, false, "bounded results are context selection, not a truncated proposal");
+});
+
+test("snapshot: bounded history keeps the MOST RECENT turns and states exact original chars", () => {
+	const turns: Msg[] = [];
+	for (let i = 1; i <= 6; i++) {
+		turns.push(assistant(`turn ${i} ${"m".repeat(4000)}`, [], "stop"));
+	}
+	const target = assistant("done", [], "stop");
+	const snap = build([...turns, target], target, []);
+	const history = snap.representation.history as { text: string; truncated: boolean; chars: number; elided_chars: number; turns: number; turns_omitted: number };
+
+	assert.equal(history.truncated, true);
+	assert.equal(history.chars, 6 * (7 + 4000), "exact original content chars, labels excluded: 6 turns x (`turn N ` + 4000)");
+	assert.equal(snap.truncated, false, "a bounded transcript is not a truncated proposal");
+	assert.ok(snap.actorText.length <= config.limits.maxEvidenceChars, "the bound is honored by the bytes");
+	assert.ok(snap.actorText.includes("turn 6"), "newest text survives");
+	assert.ok(!snap.actorText.includes("turn 1 "), "oldest text is what gets dropped");
+	assert.ok(snap.actorText.includes("characters elided"));
+	assert.ok(history.elided_chars > 0 && history.turns_omitted > 0);
 });
 
 test("snapshotToolCalls: names and argument strings are scrubbed before hashing", () => {

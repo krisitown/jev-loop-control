@@ -5,7 +5,7 @@ export interface CompletionContinuationContext {
 	mode: Mode;
 	traceEnabled: boolean;
 	signal: AbortSignal | undefined;
-	maxInterventionsPerTask: number;
+	maxInterventionsPerTask: number | null;
 	maxTerminalContinuations: number;
 	interventionsUsed: number;
 	terminalContinuationsUsed: number;
@@ -24,7 +24,7 @@ export function applyCompletionContinuation(
 	if (event.continue) return undefined;
 	if (event.entries.length > 0) return undefined;
 	if (decision.apply !== "continue") return undefined;
-	if (ctx.interventionsUsed >= ctx.maxInterventionsPerTask) return undefined;
+	if (ctx.maxInterventionsPerTask !== null && ctx.interventionsUsed >= ctx.maxInterventionsPerTask) return undefined;
 	if (ctx.terminalContinuationsUsed >= ctx.maxTerminalContinuations) return undefined;
 
 	return {

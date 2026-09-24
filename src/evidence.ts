@@ -19,7 +19,7 @@
  * the request builder renders from.
  */
 
-import { capText, hashJson, redactText, removeLiteral } from "./redact.ts";
+import { capText, ELISION_MARK, hashJson, redactText, removeLiteral } from "./redact.ts";
 import type {
 	DeterministicFact,
 	EvidenceSnapshot,
@@ -76,6 +76,122 @@ export const RESERVED_REQUIREMENT_IDS = [
 ] as const;
 
 const REQUIREMENT_ID_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,15}$/;
+
+/** Character budget of one retained tool-result text, and of one historical call's arguments. */
+export const OBSERVATION_TEXT_CHARS = 2000;
+export const OBSERVATION_ARGS_CHARS = 600;
+/** How many of the most recent observations `recent_actions` summarizes. */
+const RECENT_ACTIONS_WINDOW = 24;
+const FACTS_WINDOW = 24;
+/** Retention of results: the most recent N, plus the most recent M errors outside that window. */
+const RECENT_RESULTS = 12;
+const ERROR_HISTORY = 2;
+
+export interface HistoryTurn {
+	role: string;
+	text: string;
+}
+
+export interface ObservationTruncation {
+	/** Evidence id (`E1`, `E2`, ...), never a redacted tool-call id. */
+	id: string;
+	/** Redacted tool-call id, for cross-reference only; never used as a lookup key. */
+	tool_call_id: string;
+	truncated: boolean;
+	originalChars: number;
+	retainedChars: number;
+}
+
+export interface BoundedHistory {
+	text: string;
+	truncated: boolean;
+	/** Exact character count of the ORIGINAL turn content (turn labels are formatting). */
+	chars: number;
+	/** Exact character count of the rendered text that was dropped. */
+	elided_chars: number;
+	turns: number;
+	turns_omitted: number;
+}
+
+/**
+ * Cap to EXACTLY `maxChars`.
+ *
+ * `capText` from redact.ts renders head + marker + tail, but it sizes head/tail
+ * from `maxChars` and appends the marker text AFTER them, so its result is
+ * `maxChars + 42` and its split leaves content unused. A stated bound the bytes
+ * do not honor is not a bound, so the split is solved here instead: keep as much
+ * head as fits once the tail and the marker are accounted for, so the retained
+ * text hits the stated bound exactly (head >= 1, tail >= 1, marker retained).
+ */
+function capTo(text: string, maxChars: number): { text: string; truncated: boolean; chars: number } {
+	const chars = text.length;
+	if (chars <= maxChars) {
+		return { text, truncated: false, chars };
+	}
+	const tail = Math.max(1, Math.floor(maxChars * 0.3));
+	for (let head = Math.max(1, Math.ceil(maxChars * 0.6)); head >= 1; head--) {
+		const kept = head + tail;
+		if (kept >= maxChars) {
+			continue;
+		}
+		const candidate = `${text.slice(0, head)}\n${ELISION_MARK} ${chars - kept} characters elided ${ELISION_MARK}\n${text.slice(chars - tail)}`;
+		if (candidate.length === maxChars) {
+			return { text: candidate, truncated: true, chars };
+		}
+		if (candidate.length < maxChars) {
+			// Marker digits shrank; pad by extending the head to hit the bound exactly.
+			const grown = head + (maxChars - candidate.length);
+			if (grown + tail < maxChars && grown <= chars - tail) {
+				return { text: `${text.slice(0, grown)}\n${ELISION_MARK} ${chars - grown - tail} characters elided ${ELISION_MARK}\n${text.slice(chars - tail)}`, truncated: true, chars };
+			}
+			return { text: candidate.slice(0, maxChars), truncated: true, chars };
+		}
+	}
+	return { text: text.slice(0, maxChars), truncated: true, chars };
+}
+
+/**
+ * Bound an actor/user transcript to `maxChars` by keeping the MOST RECENT turns
+ * (the boundary turn keeps its own tail), then stating exactly what was dropped.
+ * Character accounting counts original turn content only: `[role]: ` labels and
+ * the blank-line separators are rendering, and would otherwise inflate `chars`.
+ */
+export function boundHistory(turns: readonly HistoryTurn[], maxChars: number): BoundedHistory {
+	const render = (turn: HistoryTurn): string => `[${turn.role}]: ${turn.text}`;
+	const chars = turns.reduce((total, turn) => total + turn.text.length, 0);
+	const rendered = turns.map(render);
+	const joined = rendered.join("\n\n");
+	if (joined.length <= maxChars) {
+		return { text: joined, truncated: false, chars, elided_chars: 0, turns: turns.length, turns_omitted: 0 };
+	}
+	// Room for the elision marker itself, so `text` never exceeds maxChars.
+	const reserve = Math.min(64, Math.max(16, Math.floor(maxChars / 8)));
+	const budget = Math.max(0, maxChars - reserve);
+	const kept: string[] = [];
+	let used = 0;
+	let turnsOmitted = 0;
+	for (let index = rendered.length - 1; index >= 0; index--) {
+		const piece = rendered[index]!;
+		const cost = kept.length === 0 ? piece.length : piece.length + 2;
+		if (used + cost <= budget) {
+			kept.unshift(piece);
+			used += cost;
+			continue;
+		}
+		// Boundary turn: keep its most recent characters, then everything older is out.
+		const room = budget - used - (kept.length === 0 ? 0 : 2);
+		if (room > 0) {
+			kept.unshift(piece.slice(piece.length - room));
+		}
+		turnsOmitted = index;
+		break;
+	}
+	turnsOmitted += turns.length - 1 - (kept.length === 0 ? rendered.length : rendered.indexOf(kept[0]!));
+	const body = kept.join("\n\n");
+	const elided = Math.max(0, joined.length - body.length);
+	const marker = `${ELISION_MARK} ${elided} characters elided ${ELISION_MARK}\n`;
+	return { text: `${marker}${body}`, truncated: true, chars, elided_chars: elided, turns: turns.length, turns_omitted: turnsOmitted };
+}
 
 export function isToolResultMessage(message: Msg | undefined): boolean {
 	return message !== undefined && (message.role === "toolResult" || message.role === "tool_result" || message.role === "tool");
@@ -296,6 +412,11 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 		}
 	}
 	const observationsAll: SnapshotObservation[] = [];
+	// Truncation metadata is recorded AT CREATION, keyed by the observation's own
+	// evidence id, and computed from the raw text of THAT message. Looking a result
+	// up later by its (redacted) tool-call id would compare a sanitized id against
+	// unsanitized messages and silently report zeros for any id carrying a secret.
+	const truncationById = new Map<string, ObservationTruncation>();
 	for (const message of input.messages) {
 		if (!isToolResultMessage(message)) {
 			continue;
@@ -304,35 +425,67 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 		const didExecute = rawCallId !== "" && input.executedToolCallIds.has(rawCallId);
 		const toolCallId = scrub(rawCallId);
 		const found = callsById.get(rawCallId);
+		const id = `E${observationsAll.length + 1}`;
+		// Result text is bounded, and the bound is visible in `representation`.
+		const capped = capTo(scrub(visibleText(message)), OBSERVATION_TEXT_CHARS);
+		truncationById.set(id, {
+			id,
+			tool_call_id: toolCallId,
+			truncated: capped.truncated,
+			originalChars: capped.chars,
+			retainedChars: capped.text.length,
+		});
 		observationsAll.push({
-			id: `E${observationsAll.length + 1}`,
+			id,
 			toolName: scrub(typeof message.toolName === "string" ? message.toolName : (found?.name ?? "unknown")),
 			toolCallId,
 			ok: message.isError !== true,
 			provenance: didExecute ? "executed" : "reported_without_execution_event",
-			// Result text is bounded, and the bound is visible in `representation`.
-			text: capText(scrub(visibleText(message)), 1200).text,
+			// `capText` puts its marker OUTSIDE the requested budget (head+tail plus the
+			// marker text), so cap content at `budget - markerOverhead(budget)` to make
+			// the retained text exactly `OBSERVATION_TEXT_CHARS`.
+			text: capped.text,
 			...(found ? { arguments: found.arguments, argsHash: found.argsHash } : {}),
 		});
 	}
-	// The most recent results are sent in full; older ones are listed by id.
-	const retained = observationsAll.slice(-6);
-	const omittedObservationIds = observationsAll.slice(0, Math.max(0, observationsAll.length - 6)).map((observation) => observation.id);
+	// Retention: the 12 most recent results, plus the 2 most recent ERRORS that
+	// fall outside that window, so a failure is never forgotten just because the
+	// actor kept working. Ids are positional, so a dropped older observation still
+	// shows up in `omitted_evidence_ids` by its original id.
+	const lastWindow = observationsAll.slice(-RECENT_RESULTS);
+	const lastIds = new Set(lastWindow.map((observation) => observation.id));
+	const errorsOutside = observationsAll.filter((observation) => !observation.ok && !lastIds.has(observation.id)).slice(-ERROR_HISTORY);
+	const keptPositions = new Set<number>([
+		...lastWindow.map((observation) => observationsAll.indexOf(observation)),
+		...errorsOutside.map((observation) => observationsAll.indexOf(observation)),
+	]);
+	const retained = observationsAll.filter((_, index) => keptPositions.has(index));
+	const omittedObservationIds = observationsAll.filter((_, index) => !keptPositions.has(index)).map((observation) => observation.id);
+
+	// Metadata only for what is actually retained; a dropped observation is already
+	// listed by id in `omitted_evidence_ids`.
+	const truncationMeta = retained.map((observation) => truncationById.get(observation.id)!);
+
+	const argumentsTruncatedCount = observationsAll
+			.slice(-RECENT_ACTIONS_WINDOW)
+			.filter((observation) => observation.arguments !== undefined && JSON.stringify(observation.arguments).length > OBSERVATION_ARGS_CHARS)
+			.length;
 
 	const proposalText = scrub(visibleText(input.target));
 	// History excludes the candidate itself: `final_answer` must be the current
-	// terminal text, not a concatenation of everything the actor said.
-	const historyParts: string[] = [];
+	// terminal text, not a concatenation of everything the actor said. When it must
+	// be bounded, the MOST RECENT turns are kept (the oldest content is dropped),
+	// never a fixed prefix of the transcript.
+	const historyTurns: HistoryTurn[] = [];
 	for (const message of input.messages) {
-		if (message === input.target || message.role !== "assistant") {
-			continue;
-		}
-		const text = visibleText(message);
+		if (message === input.target) continue;
+		if (message.role !== "assistant" && message.role !== "user") continue;
+		const text = scrub(visibleText(message));
 		if (text) {
-			historyParts.push(text);
+			historyTurns.push({ role: message.role, text });
 		}
 	}
-	const history = capText(scrub(historyParts.join("\n\n")), input.config.limits.maxEvidenceChars);
+	const history = boundHistory(historyTurns, input.config.limits.maxEvidenceChars);
 	const toolCalls = snapshotToolCalls(input.target, scrub);
 	const facts = deterministicFacts(input.messages, input.executedToolCallIds, scrub);
 	const priorInterventions = input.priorInterventions.slice(-5).map((entry) => ({ kind: scrub(entry.kind), at: entry.at, focus: scrub(entry.focus) }));
@@ -356,18 +509,46 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 			tool_calls: toolCalls,
 		},
 		observations: retained,
-		recent_actions: observationsAll.map((observation) => ({
-			tool: observation.toolName,
-			tool_call_id: observation.toolCallId,
-			result: observation.ok ? "success" : "error",
-			executed: observation.provenance === "executed",
-			evidence_id: observation.id,
-			...(observation.arguments !== undefined ? { arguments: observation.arguments, arguments_hash: observation.argsHash } : {}),
-		})),
-		facts,
+		recent_actions: (() => {
+			const recent = observationsAll.slice(-RECENT_ACTIONS_WINDOW);
+			return recent.map((observation) => {
+				// Historical arguments are bounded to a summary; the ORIGINAL argument
+				// hash is kept so a repeat is still detected exactly. The current
+				// proposal's own arguments are never bounded (see `proposal.tool_calls`).
+				let args = observation.arguments;
+				let argsTruncated = false;
+				let argsChars: number | undefined;
+				if (args !== undefined) {
+					const strArgs = JSON.stringify(args);
+					const capped = capTo(strArgs, OBSERVATION_ARGS_CHARS);
+					if (capped.truncated) {
+						args = { _summary: capped.text, _original_chars: capped.chars };
+						argsTruncated = true;
+						argsChars = capped.chars;
+					}
+				}
+				return {
+					tool: observation.toolName,
+					tool_call_id: observation.toolCallId,
+					result: observation.ok ? "success" : "error",
+					executed: observation.provenance === "executed",
+					evidence_id: observation.id,
+					...(args !== undefined ? { arguments: args, arguments_hash: observation.argsHash, arguments_truncated: argsTruncated, ...(argsChars !== undefined ? { arguments_chars: argsChars } : {}) } : {}),
+				};
+			});
+		})(),
+		facts: facts.slice(-FACTS_WINDOW),
+		facts_omitted_count: Math.max(0, facts.length - FACTS_WINDOW),
 		prior_interventions: priorInterventions,
 		omitted_evidence_ids: omittedObservationIds,
 		omitted_observation_count: omittedObservationIds.length,
+		context_selection: {
+			truncation_metadata: truncationMeta,
+			recent_actions_count: Math.min(RECENT_ACTIONS_WINDOW, observationsAll.length),
+			facts_count: Math.min(FACTS_WINDOW, facts.length),
+			arguments_truncated_count: argumentsTruncatedCount,
+			history_turns_omitted: history.turns_omitted,
+		},
 	};
 
 	const snapshotHash = hashJson(representation);
@@ -390,7 +571,10 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 		priorInterventions,
 		facts,
 		scope: { ...input.scope, snapshotHash },
-		truncated: history.truncated || serialized.length > input.config.limits.maxEvidenceChars,
+		// Bounded HISTORY or bounded HISTORICAL arguments are context selection, not
+		// a limitation of the thing being assessed. `truncated` is reserved for the
+		// current proposal itself, which this builder never trims.
+		truncated: false,
 		representation,
 	};
 }

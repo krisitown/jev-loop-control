@@ -8,16 +8,17 @@ import { buildQuestions, buildState } from "./questions.ts";
 import { decideDirection, decideCompletion } from "./policy.ts";
 import { TraceStore, defaultRunsDir, runId } from "./trace.ts";
 import { makeScrub, redactValue } from "./redact.ts";
-import type { Assessment, BudgetState, Decision, EvidenceSnapshot, Question } from "./types.ts";
+import type { Assessment, BudgetState, Decision, EvidenceSnapshot, Question, JevClient } from "./types.ts";
 import { applyCompletionContinuation, applyDirectionBlock } from "./interventions.ts";
 import { assessmentBudgetReason } from "./budget.ts";
 import type { ToolCallEventResult, ToolCallEvent } from "@earendil-works/pi-coding-agent";
+import { createRecovery, advanceRecovery, recoveryInstruction, beginRecovery, recoveryEvidenceKey, type RecoveryState, type RecoveryMode } from "./recovery.ts";
 
 interface LiveState {
 	config: SupervisorConfig;
 	trace: TraceStore;
 	scrub: (text: string) => string;
-	client: ReturnType<typeof createHttpClient>;
+	client: JevClient;
 	messages: Msg[];
 	executedIds: Set<string>;
 	budget: BudgetState;
@@ -46,9 +47,23 @@ interface LiveState {
 	batchBlockReason: string | null;
 	completionDecision: Decision | undefined;
 	completionSignal: AbortSignal | undefined;
+	completionSnapshot: EvidenceSnapshot | null;
+	recovery: RecoveryState;
+	epoch: number;
+	/** Epoch of the run that produced `completionDecision`; a mismatch is stale. */
+	completionEpoch: number;
+	proposalId: string;
+	lastFailure: string | null;
+	/** Deferred siblings of a batch already counted as one intervention. */
+	deferredSiblings: number;
+	/** Last guidance actually injected, so one recovery objective traces once. */
+	guidanceKey: string | null;
 }
 
-export function liveObserve(pi: ExtensionAPI): void {
+/** Our own injected guidance message; the context hook drops nothing else. */
+const GUIDANCE_CUSTOM_TYPE = "jev-loop-control.recovery-guidance";
+
+export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClient }): void {
 	let state: LiveState | undefined;
 	let activation = { reason: "session not started", configPath: "", cwd: "", mode: "off", enabled: false, hint: "apiKeyEnv must name an environment variable such as AI_GATEWAY_API_KEY. Export that variable before launching Pi; restart after environment changes." };
 	let activationScrub = makeScrub([]);
@@ -101,7 +116,7 @@ export function liveObserve(pi: ExtensionAPI): void {
 		const traceDir = config.trace.dir ? join(config.trace.dir, runIdStr) : defaultRunsDir(agentDir, runIdStr);
 		const trace = new TraceStore({ dir: traceDir, artifacts: config.trace.artifacts, runId: runIdStr, scrub: makeScrub([apiKey]) });
 
-		const client = createHttpClient({
+		const client = dependencies?.client ?? createHttpClient({
 			endpoint: config.jev.endpoint,
 			model: config.jev.model,
 			apiKeyEnv: config.jev.apiKeyEnv,
@@ -144,6 +159,14 @@ export function liveObserve(pi: ExtensionAPI): void {
 			batchBlockReason: null,
 			completionDecision: undefined,
 			completionSignal: undefined,
+			completionSnapshot: null,
+			recovery: createRecovery(),
+			epoch: 0,
+			completionEpoch: -1,
+			proposalId: "",
+			lastFailure: null,
+			deferredSiblings: 0,
+			guidanceKey: null,
 		};
 
 		activation.reason = "";
@@ -154,10 +177,15 @@ export function liveObserve(pi: ExtensionAPI): void {
 	pi.on("input", (event) => {
 		if (!state) return;
 		if (event.source !== "extension") {
-			state.userTask = typeof event.text === "string" ? event.text : "";
-			state.taskId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-			state.messages = [];
-			state.executedIds = new Set();
+			const newText = typeof event.text === "string" ? event.text : "";
+			if (state.userTask) {
+				state.userTask += "\n\n--- Follow-up Correction ---\n" + newText;
+			} else {
+				state.userTask = newText;
+			}
+			if (!state.taskId) {
+				state.taskId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+			}
 			state.finalMessage = undefined;
 			state.completionAssessed = false;
 			state.assessmentPromise = null;
@@ -167,11 +195,10 @@ export function liveObserve(pi: ExtensionAPI): void {
 			state.finalStatus = "UNCHECKED";
 			state.completionDecision = undefined;
 			state.completionSignal = undefined;
+			state.completionSnapshot = null;
 			state.batchBlocked = false;
 			state.batchBlockReason = null;
-			state.interventionsUsed = 0;
-			state.terminalContinuationsUsed = 0;
-			state.lastFocusKey = null;
+			state.epoch++;
 
 			let manifestText: string | undefined;
 			if (state.config.taskManifestPath !== null) {
@@ -208,6 +235,15 @@ export function liveObserve(pi: ExtensionAPI): void {
 		state.messages.push(msg);
 		if (msg.role === "assistant") {
 			state.finalMessage = msg;
+			state.proposalNumber++;
+			state.proposalId = `p${state.proposalNumber}`;
+			if (state.recovery.active) {
+				const prevActive = state.recovery.active;
+				const expired = advanceRecovery(state.recovery);
+				if (expired) {
+					state.trace.record("recovery.expired", { mode: prevActive.mode, objective: prevActive.objective });
+				}
+			}
 			if (toolCallsOf(msg).length > 0) {
 				state.assessmentPromise = null;
 				state.batchBlocked = false;
@@ -220,13 +256,13 @@ export function liveObserve(pi: ExtensionAPI): void {
 
 	pi.on("tool_execution_start", (event) => {
 		if (!state) return;
-		state.executedIds.add(event.toolCallId);
-		state.newEvidence = true;
 		state.trace.record("tool_execution_start", { toolCallId: event.toolCallId, toolName: event.toolName });
 	});
 
 	pi.on("tool_result", (event) => {
 		if (!state) return;
+		state.executedIds.add(event.toolCallId);
+		state.newEvidence = true;
 		state.trace.record("tool_result", {
 			toolCallId: event.toolCallId,
 			toolName: event.toolName,
@@ -238,6 +274,7 @@ export function liveObserve(pi: ExtensionAPI): void {
 	pi.on("tool_call", async (event, ctx) => {
 		if (!state) return undefined;
 		const s = state;
+		const epoch = s.epoch;
 
 		s.trace.record("tool_call", {
 			toolCallId: event.toolCallId,
@@ -246,17 +283,13 @@ export function liveObserve(pi: ExtensionAPI): void {
 		});
 
 		if (s.batchBlocked && s.config.mode === "enforce" && s.trace.enabled && !ctx.signal?.aborted) {
-			s.trace.record("intervention.block", {
-				toolCallId: event.toolCallId,
-				toolName: event.toolName,
-				reason: s.batchBlockReason,
-				actualApply: "block",
-			});
+			deferSiblingBlock(s, event);
 			return { block: true, reason: s.batchBlockReason ?? "supervisor blocked" };
 		}
 
 		if (s.assessmentPromise) {
 			const decision = await s.assessmentPromise;
+			if (state !== s || s.epoch !== epoch) return undefined;
 			return applyToolCallDecision(s, decision, event, ctx);
 		}
 
@@ -278,7 +311,7 @@ export function liveObserve(pi: ExtensionAPI): void {
 			executedToolCallIds: new Set(s.executedIds),
 			requirements: [...s.requirements],
 			manifest: s.manifest,
-			priorInterventions: [],
+			priorInterventions: s.recovery.history.map(h => ({ kind: h.kind, at: h.at, focus: h.objective })),
 			config: s.config,
 			secrets: s.secrets,
 			scope: {
@@ -290,19 +323,19 @@ export function liveObserve(pi: ExtensionAPI): void {
 
 		const questions = buildQuestions("direction", snapshot);
 		const controller = {
-			workMode: "EXECUTE",
+			workMode: s.recovery.active?.mode ?? "EXECUTE",
 			proposalNumber: s.proposalNumber,
 			interventionsUsed: s.interventionsUsed,
 			interventionLimit: s.config.limits.maxInterventionsPerTask,
-			previousInterventions: [],
+			previousInterventions: s.recovery.history.map(h => ({ kind: h.kind, status: h.status, focus: h.focus, at: h.at })),
+			recoveryObjective: s.recovery.active?.objective,
 		};
-		const stateEnvelope = buildState({ kind: "direction", snapshot, controller, proposalId: `p${s.proposalNumber}` });
+		const stateEnvelope = buildState({ kind: "direction", snapshot, controller, proposalId: s.proposalId });
 
 		const reserve = s.config.budget.reserveUsdPerRequest;
 		s.budget.reservedUsd += reserve;
 		s.budget.requestsUsed++;
 		s.assessmentsUsed++;
-		s.proposalNumber++;
 
 		const promise = s.client.assess({
 			kind: "direction",
@@ -325,6 +358,15 @@ export function liveObserve(pi: ExtensionAPI): void {
 			a.artifacts = { request: requestPath, response: responsePath };
 
 			const decision = decideDirection({ kind: "direction", assessment: a, snapshot, config: s.config, counters: { interventionsUsed: s.interventionsUsed, terminalContinuationsUsed: s.terminalContinuationsUsed, assessmentsUsed: s.assessmentsUsed, lastFocusKey: s.lastFocusKey, newEvidence: s.newEvidence } });
+			if (!a.ok) {
+				const msg = s.scrub(a.failure?.message ?? "assessment failed");
+				if (s.lastFailure !== msg) {
+					console.error(msg);
+					s.lastFailure = msg;
+				}
+			} else {
+				s.lastFailure = null;
+			}
 			s.trace.record("direction_assessment", {
 				ok: a.ok,
 				answers: a.answers,
@@ -340,11 +382,18 @@ export function liveObserve(pi: ExtensionAPI): void {
 				reasons: decision.reasons,
 				recommendedApply: decision.apply,
 				actualApply: "none",
+				proposalId: s.proposalId,
+				contextSelection: snapshot.representation.context_selection,
 			});
 			return decision;
 		}).catch((e) => {
 			s.budget.reservedUsd -= reserve;
-			s.trace.record("assessment_failure", { kind: "direction", error: String(e) });
+			const msg = s.scrub(String(e));
+			if (s.lastFailure !== msg) {
+				console.error(msg);
+				s.lastFailure = msg;
+			}
+			s.trace.record("assessment_failure", { kind: "direction", error: msg });
 			return undefined;
 		});
 
@@ -354,12 +403,14 @@ export function liveObserve(pi: ExtensionAPI): void {
 		s.assessmentState = stateEnvelope;
 
 		const decision = await promise;
+		if (state !== s || s.epoch !== epoch) return undefined;
 		return applyToolCallDecision(s, decision, event, ctx);
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
 		if (!state) return;
 		const s = state;
+		const epoch = s.epoch;
 		const last = event.messages.at(-1) as Msg | undefined;
 		if (last && isTerminalCandidate(last)) {
 			s.finalMessage = last;
@@ -383,7 +434,7 @@ export function liveObserve(pi: ExtensionAPI): void {
 					executedToolCallIds: new Set(s.executedIds),
 					requirements: [...s.requirements],
 					manifest: s.manifest,
-					priorInterventions: [],
+					priorInterventions: s.recovery.history.map(h => ({ kind: h.kind, at: h.at, focus: h.objective })),
 					config: s.config,
 					secrets: s.secrets,
 					scope: {
@@ -394,13 +445,14 @@ export function liveObserve(pi: ExtensionAPI): void {
 				});
 				const questions = buildQuestions("completion", snapshot);
 				const controller = {
-					workMode: "EXECUTE",
+					workMode: s.recovery.active?.mode ?? "EXECUTE",
 					proposalNumber: s.proposalNumber,
 					interventionsUsed: s.interventionsUsed,
 					interventionLimit: s.config.limits.maxInterventionsPerTask,
-					previousInterventions: [],
+					previousInterventions: s.recovery.history.map(h => ({ kind: h.kind, status: h.status, focus: h.focus, at: h.at })),
+					recoveryObjective: s.recovery.active?.objective,
 				};
-				const stateEnvelope = buildState({ kind: "completion", snapshot, controller, proposalId: "final" });
+				const stateEnvelope = buildState({ kind: "completion", snapshot, controller, proposalId: s.proposalId });
 
 				const reserve = s.config.budget.reserveUsdPerRequest;
 				s.budget.reservedUsd += reserve;
@@ -429,6 +481,15 @@ export function liveObserve(pi: ExtensionAPI): void {
 					a.artifacts = { request: requestPath, response: responsePath };
 
 					const decision = decideCompletion({ kind: "completion", assessment: a, snapshot, config: s.config, counters: { interventionsUsed: s.interventionsUsed, terminalContinuationsUsed: s.terminalContinuationsUsed, assessmentsUsed: s.assessmentsUsed, lastFocusKey: s.lastFocusKey, newEvidence: s.newEvidence } });
+					if (!a.ok) {
+						const msg = s.scrub(a.failure?.message ?? "assessment failed");
+						if (s.lastFailure !== msg) {
+							console.error(msg);
+							s.lastFailure = msg;
+						}
+					} else {
+						s.lastFailure = null;
+					}
 					s.trace.record("completion_assessment", {
 						ok: a.ok,
 						answers: a.answers,
@@ -444,13 +505,23 @@ export function liveObserve(pi: ExtensionAPI): void {
 						reasons: decision.reasons,
 						recommendedApply: decision.apply,
 						actualApply: "none",
+						proposalId: s.proposalId,
+						contextSelection: snapshot.representation.context_selection,
 					});
+					if (state !== s || s.epoch !== epoch) return;
 					s.finalStatus = decision.status;
 					s.completionDecision = decision;
 					s.completionSignal = ctx.signal;
+					s.completionSnapshot = snapshot;
+					s.completionEpoch = epoch;
 				} catch (e) {
 					s.budget.reservedUsd -= reserve;
-					s.trace.record("assessment_failure", { kind: "completion", error: String(e) });
+					const msg = s.scrub(String(e));
+					if (s.lastFailure !== msg) {
+						console.error(msg);
+						s.lastFailure = msg;
+					}
+					s.trace.record("assessment_failure", { kind: "completion", error: msg });
 				}
 			}
 		}
@@ -460,6 +531,16 @@ export function liveObserve(pi: ExtensionAPI): void {
 		if (!state) return undefined;
 		const s = state;
 		if (!s.completionDecision) return undefined;
+		// A decision from a superseded run never acts on this boundary.
+		if (s.completionEpoch !== s.epoch) {
+			s.trace.record("intervention.suppressed", {
+				reason: "stale_epoch",
+				proposalId: s.proposalId,
+				requestId: s.completionDecision.assessment.requestId,
+			});
+			s.completionDecision = undefined;
+			return undefined;
+		}
 		const result = applyCompletionContinuation(event, s.completionDecision, {
 			mode: s.config.mode,
 			traceEnabled: s.trace.enabled,
@@ -471,6 +552,24 @@ export function liveObserve(pi: ExtensionAPI): void {
 		});
 		const decision = s.completionDecision;
 		if (result) {
+			if (s.completionSnapshot && decision.memo && decision.focusKey) {
+				const applied = beginRecovery(s.recovery, {
+					mode: decision.status as RecoveryMode,
+					objective: decision.memo,
+					focusKey: decision.focusKey,
+					evidenceKey: recoveryEvidenceKey(s.completionSnapshot),
+					at: new Date().toISOString(),
+				}, s.config.limits.proposalLease);
+				if (!applied) {
+					s.trace.record("intervention.suppressed", {
+						reason: "duplicate_objective_evidence",
+						proposalId: s.proposalId,
+						requestId: decision.assessment.requestId,
+					});
+					s.completionDecision = undefined;
+					return undefined;
+				}
+			}
 			s.interventionsUsed++;
 			s.terminalContinuationsUsed++;
 			s.lastFocusKey = decision.focusKey;
@@ -479,6 +578,11 @@ export function liveObserve(pi: ExtensionAPI): void {
 				status: decision.status,
 				reasons: decision.reasons,
 				memo: decision.memo,
+				actualApply: "continue",
+				mode: decision.status,
+				objective: decision.memo,
+				proposalId: s.proposalId,
+				requestId: decision.assessment.requestId,
 				counters: { interventionsUsed: s.interventionsUsed, terminalContinuationsUsed: s.terminalContinuationsUsed },
 			});
 			s.completionAssessed = false;
@@ -493,9 +597,11 @@ export function liveObserve(pi: ExtensionAPI): void {
 		state.trace.writeJson("summary.json", {
 			runId: state.trace.runId,
 			mode: state.config.mode,
-			origin: "live",
+			origin: state.client.origin,
 			finalStatus,
+			lastFailure: state.lastFailure,
 			actualInterventions: state.interventionsUsed,
+			deferredSiblings: state.deferredSiblings,
 			terminalContinuations: state.terminalContinuationsUsed,
 			assessments: state.assessmentsUsed,
 			requests: state.budget.requestsUsed,
@@ -506,7 +612,8 @@ export function liveObserve(pi: ExtensionAPI): void {
 			finishedAt: new Date().toISOString(),
 			problems: state.problems,
 			notices: state.notices,
-			errors: [],
+			errors: state.trace.failure !== null ? [state.trace.failure] : [],
+			traceFailure: state.trace.failure,
 		});
 	});
 
@@ -514,6 +621,43 @@ export function liveObserve(pi: ExtensionAPI): void {
 		if (state) {
 			state.trace.record("session_shutdown");
 		}
+	});
+
+	pi.on("context", (event, ctx) => {
+		if (!state) return undefined;
+		const s = state;
+		if (s.config.mode !== "enforce") return undefined;
+		if (!s.trace.enabled) return undefined;
+		if (ctx.signal?.aborted) return undefined;
+
+		// Only our own previous guidance is dropped; everything else, including Pi's
+		// prompt and tool state, passes through untouched.
+		const messages = event.messages.filter((message) => !(message.role === "custom" && message.customType === GUIDANCE_CUSTOM_TYPE));
+		const instruction = recoveryInstruction(s.recovery);
+		if (instruction && s.recovery.active) {
+			messages.push({
+				role: "custom",
+				customType: GUIDANCE_CUSTOM_TYPE,
+				content: instruction,
+				display: false,
+				timestamp: Date.now(),
+			});
+			const key = `${s.recovery.active.focusKey}:${s.recovery.active.objective}`;
+			if (s.guidanceKey !== key) {
+				s.guidanceKey = key;
+				s.trace.record("recovery.guidance", {
+					mode: s.recovery.active.mode,
+					objective: s.recovery.active.objective,
+					remainingProposals: s.recovery.active.remainingProposals,
+					proposalId: s.proposalId,
+					content: instruction,
+				});
+			}
+		}
+		else {
+			s.guidanceKey = null;
+		}
+		return { messages };
 	});
 
 	pi.registerCommand("jev-status", {
@@ -535,11 +679,14 @@ export function liveObserve(pi: ExtensionAPI): void {
 					maxRequests: state.config.budget.maxRequests,
 					allowanceUsd: state.config.budget.allowanceUsd,
 					maxAssessments: state.config.limits.maxAssessments,
+					maxInterventions: state.config.limits.maxInterventionsPerTask,
 				},
 				requests: state.budget.requestsUsed,
 				assessments: state.assessmentsUsed,
 				budget: state.budget,
 				traceDir: state.trace.dir,
+				activeRecovery: state.recovery.active,
+				lastFailure: state.lastFailure,
 			};
 			const scrubbed = activationScrub(JSON.stringify(status, null, 2));
 			if (ctx.hasUI) ctx.ui.notify(scrubbed);
@@ -549,16 +696,29 @@ export function liveObserve(pi: ExtensionAPI): void {
 
 	function applyToolCallDecision(s: LiveState, decision: Decision | undefined, event: ToolCallEvent, ctx: ExtensionContext): ToolCallEventResult | undefined {
 		if (s.batchBlocked && s.config.mode === "enforce" && s.trace.enabled && !ctx.signal?.aborted) {
-			s.trace.record("intervention.block", {
-				toolCallId: event.toolCallId,
-				toolName: event.toolName,
-				reason: s.batchBlockReason,
-				actualApply: "block",
-			});
+			deferSiblingBlock(s, event);
 			return { block: true, reason: s.batchBlockReason ?? "supervisor blocked" };
 		}
 
-		if (decision && decision.apply === "block" && s.config.mode === "enforce" && s.trace.enabled && !ctx.signal?.aborted && s.interventionsUsed < s.config.limits.maxInterventionsPerTask) {
+		const cap = s.config.limits.maxInterventionsPerTask;
+		if (decision && decision.apply === "block" && s.config.mode === "enforce" && s.trace.enabled && !ctx.signal?.aborted && (cap === null || s.interventionsUsed < cap)) {
+			if (s.assessmentSnapshot && decision.memo && decision.focusKey && ["RESEARCH", "REPLAN", "VERIFY", "EXECUTE"].includes(decision.status)) {
+				const applied = beginRecovery(s.recovery, {
+					mode: decision.status as RecoveryMode,
+					objective: decision.memo,
+					focusKey: decision.focusKey,
+					evidenceKey: recoveryEvidenceKey(s.assessmentSnapshot),
+					at: new Date().toISOString(),
+				}, s.config.limits.proposalLease);
+				if (!applied) {
+					s.trace.record("intervention.suppressed", {
+						reason: "duplicate_objective_evidence",
+						proposalId: s.proposalId,
+						requestId: decision.assessment.requestId,
+					});
+					return undefined;
+				}
+			}
 			s.batchBlocked = true;
 			s.batchBlockReason = decision.memo ?? "supervisor blocked";
 			s.interventionsUsed++;
@@ -569,14 +729,37 @@ export function liveObserve(pi: ExtensionAPI): void {
 				toolName: event.toolName,
 				reason: s.batchBlockReason,
 				actualApply: "block",
+				sibling: false,
 				status: decision.status,
 				reasons: decision.reasons,
 				memo: decision.memo,
+				proposalId: s.proposalId,
+				requestId: decision.assessment.requestId,
+				mode: decision.status,
+				objective: decision.memo,
 				counters: { interventionsUsed: s.interventionsUsed, terminalContinuationsUsed: s.terminalContinuationsUsed },
 			});
 			return applyDirectionBlock(decision, s.config.mode);
 		}
 		return undefined;
+	}
+
+	/**
+	 * A deferred sibling of an already-counted batch is NOT another intervention.
+	 * It traces as part of the same block (same proposalId) so the counts in the
+	 * trace and in summary.json are real rather than per-tool-inflated.
+	 */
+	function deferSiblingBlock(s: LiveState, event: ToolCallEvent): void {
+		s.deferredSiblings++;
+		s.trace.record("intervention.block", {
+			toolCallId: event.toolCallId,
+			toolName: event.toolName,
+			reason: s.batchBlockReason,
+			actualApply: "block",
+			sibling: true,
+			proposalId: s.proposalId,
+			counters: { interventionsUsed: s.interventionsUsed, terminalContinuationsUsed: s.terminalContinuationsUsed },
+		});
 	}
 
 	pi.registerCommand("jev-trace", {
