@@ -1,0 +1,31 @@
+# Dependencies and build output
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Local, private, and generated state (never part of the package)
+.local/
+.pi/
+.env
+.env.*
+*credentials*
+auth.json
+jev-loop-control.config.json
+jev-loop-control.config.local.json
+!jev-loop-control.config.example.json
+
+# Test and packaging artifacts
+temp_test/
+runs/
+test/**/output/
+coverage/
+archives/
+*.run.jsonl
+*.tgz
+*.tar.gz
+logs/
+*.log
+
+# Editors and operating system noise
+.DS_Store
+*.swp

@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "mode": "observe",
+  "jev": {
+    "enabled": true,
+    "endpoint": "https://ai-gateway.vercel.sh/typesafe/v1/systemone",
+    "model": "typesafe-ai/jev",
+    "apiKeyEnv": "AI_GATEWAY_API_KEY",
+    "deadlineMs": 5000
+  },
+  "budget": {
+    "maxRequests": 8,
+    "allowanceUsd": 0.10,
+    "reserveUsdPerRequest": 0.01
+  },
+  "limits": {
+    "maxInterventionsPerTask": 3,
+    "maxTerminalContinuations": 2,
+    "maxAssessments": 8
+  },
+  "trace": {
+    "dir": null,
+    "artifacts": true
+  },
+  "taskManifestPath": null
+}

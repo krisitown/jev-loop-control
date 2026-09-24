@@ -1,0 +1,51 @@
+{
+  "name": "jev-loop-control",
+  "version": "0.1.0",
+  "description": "Pi extension that supervises actor direction and completion with bounded Jev assessments (off/observe/enforce)",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "coding-agent",
+    "supervisor"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/krisitown/jev-loop-control.git"
+  },
+  "homepage": "https://github.com/krisitown/jev-loop-control#readme",
+  "bugs": {
+    "url": "https://github.com/krisitown/jev-loop-control/issues"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "jev-loop-control.config.example.json"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test \"test/*.test.ts\"",
+    "check": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@types/node": "22.19.19",
+    "typebox": "1.3.27",
+    "typescript": "5.9.3"
+  }
+}
