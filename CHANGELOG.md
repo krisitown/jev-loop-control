@@ -4,7 +4,17 @@ Notable changes to `jev-loop-control`. Entries describe shipped behaviour only.
 Measured experiment results are published separately once they are verified, so
 no entry here claims a quality improvement.
 
-## 0.2.0
+## 0.3.0 - Unreleased
+
+Validation pending. The behaviour described in the 0.2.0 checkpoint below is
+unfinished and may change before this version ships.
+
+## 0.2.0 - Development checkpoint (not a validated release)
+
+Development checkpoint, committed at `9327157`. It was never validated: the test
+and typecheck suites were not green at that commit, and the steering behaviour
+below was still being built. Do not treat this entry as a released, working
+state; see 0.3.0 for the work as it stands.
 
 ### Added
 
@@ -35,7 +45,7 @@ no entry here claims a quality improvement.
 
 ### Notes
 
-- The Pi model you configure remains the actor. Nothing in this release changes it.
+- The Pi model you configure remains the actor. Nothing in this checkpoint changes it.
 - Guidance state is held in memory for the session. Restoring it across restarts or
   session replacement is deferred.
 - Evidence is a bounded view of the task trajectory, not the whole context.

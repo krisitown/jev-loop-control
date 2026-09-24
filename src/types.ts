@@ -197,8 +197,13 @@ export interface SnapshotObservation {
 	ok: boolean;
 	provenance: ToolProvenance;
 	text: string;
-	/** Complete sanitized arguments of the finalized call, when it was found. */
+	/**
+	 * Complete sanitized arguments of the finalized call, when it was found.
+	 * The snapshot keeps them complete; the rendered `recent_actions` window may
+	 * summarize them, always alongside the untruncated `argsHash`.
+	 */
 	arguments?: unknown;
+	/** Hash of the COMPLETE sanitized arguments, never of a truncated view. */
 	argsHash?: string;
 }
 
@@ -214,6 +219,12 @@ export interface EvidenceSnapshot {
 	priorInterventions: Array<{ kind: string; at: string; focus: string }>;
 	facts: DeterministicFact[];
 	scope: { sessionId: string; taskId: string; branch: string; snapshotHash: string };
+	/**
+	 * True only when the CURRENT proposal itself had to be limited. Bounded actor
+	 * history, bounded historical results, and bounded historical arguments are
+	 * context selection and are reported under `representation.history` and
+	 * `representation.context_selection` instead, never by flipping this flag.
+	 */
 	truncated: boolean;
 	/**
 	 * The exact sanitized representation the identity hash is computed over and

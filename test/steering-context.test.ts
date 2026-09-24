@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildSnapshot, type Msg } from "../src/evidence.ts";
+import { buildQuestions, buildState } from "../src/questions.ts";
 import { defaultConfig } from "../src/config.ts";
 import type { Requirement } from "../src/types.ts";
 
@@ -125,4 +126,66 @@ test("steering-context: redaction/thinking excluded", () => {
 	
 	assert.ok(!snap.actorText.includes("secret thought"));
 	assert.ok(snap.actorText.includes("visible"));
+});
+
+test("steering-context: outgoing state carries context_selection and the active recovery objective", () => {
+	const run = assistant("run it", [{ id: "c1", name: "write", arguments: { content: "w".repeat(2000) } }]);
+	const messages = [run, toolResult("c1", "ok")];
+	const target = assistant("next", [{ id: "c2", name: "bash", arguments: { command: "make test" } }], "toolUse");
+	messages.push(target);
+	const snap = build(messages, target, ["c1"]);
+
+	const questions = buildQuestions("direction", snap);
+	assert.equal(questions.length, 3, "direction stays exactly 3 questions");
+	const nextStep = questions.find((question) => question.id === "next_step")!;
+	assert.deepEqual(Object.keys(nextStep.criteria), ["PROCEED", "RESEARCH", "REPLAN", "VERIFY", "UNCERTAIN"], "option ids are unchanged");
+
+	const state = buildState({
+		kind: "direction",
+		snapshot: snap,
+		proposalId: "p1",
+		controller: {
+			workMode: "RESEARCH",
+			proposalNumber: 4,
+			interventionsUsed: 1,
+			interventionLimit: 3,
+			previousInterventions: [{ kind: "RESEARCH", status: "expired", focus: "f1", at: "t" }],
+			recoveryObjective: "isolate the failing test",
+		},
+	});
+	const controller = state.controller as Record<string, unknown>;
+	assert.equal(controller.active_recovery_objective, "isolate the failing test", "the assessor can see the guidance in force");
+	const evidence = state.evidence as Record<string, unknown>;
+	const selection = evidence.context_selection as Record<string, unknown>;
+	assert.ok(selection, "evidence reports how the context was selected");
+	assert.ok(Array.isArray(selection.truncation_metadata));
+	assert.equal(typeof selection.arguments_truncated_count, "number");
+	assert.equal(selection.arguments_truncated_count, 1, "the oversized historical write is the only bounded argument set");
+	// The proposal's own arguments stay complete in the outgoing state.
+	const proposal = state.proposal as { tool_calls: Array<{ arguments: { command: string } }> };
+	assert.equal(proposal.tool_calls[0]!.arguments.command, "make test");
+	const historicalArgs = (evidence.recent_actions as Array<Record<string, any>>)[0]!.arguments;
+	const historical = JSON.stringify(historicalArgs);
+	assert.ok(historical.includes("[ELIDED]"), "the historical argument summary states what was bounded");
+	assert.ok(!JSON.stringify(evidence.recent_actions).includes("w".repeat(2000)), "the full historical payload is not sent");
+	assert.equal(typeof historicalArgs._summary, "string", "oversized historical arguments are replaced by a summary");
+	assert.ok(historicalArgs._summary.length <= 600, `summary is bounded, got ${historicalArgs._summary.length}`);
+	assert.ok(historical.length <= 700, `bounded summary stays bounded, got ${historical.length}`);
+	assert.equal((evidence.recent_actions as Array<Record<string, any>>)[0]!.arguments_hash.length, 16, "the original hash is kept for exact repeat detection");
+	assert.equal((state.evidence as { actor_history: { truncated: boolean } }).actor_history.truncated, false, "a short transcript is not reported as bounded");
+});
+
+test("steering-context: no active recovery sends no active_recovery_objective key", () => {
+	const target = assistant("done", [], "stop");
+	const snap = build([target], target, []);
+	const state = buildState({
+		kind: "completion",
+		snapshot: snap,
+		proposalId: "p1",
+		controller: { workMode: "EXECUTE", proposalNumber: 1, interventionsUsed: 0, interventionLimit: null, previousInterventions: [] },
+	});
+	const controller = state.controller as Record<string, unknown>;
+	assert.ok(!("active_recovery_objective" in controller), "absent means absent, never an empty string");
+	const completion = buildQuestions("completion", snap);
+	assert.deepEqual(completion.map((question) => question.id), ["requirement_R1", "final_claims_supported", "next_step"], "completion stays R+2");
 });

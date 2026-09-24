@@ -160,16 +160,18 @@ test("snapshot: final_answer/proposal text is ONLY the current candidate, histor
 
 test("snapshot: omitted evidence ids are honest; redaction and truncation are distinct", () => {
 	const messages: Msg[] = [];
-	for (let i = 1; i <= 8; i++) {
-		messages.push(toolResult(`c${i}`, `result ${i}`));
+	for (let i = 1; i <= 20; i++) {
+		// One older error (E7) so both retention rules are exercised at once.
+		messages.push(toolResult(`c${i}`, `result ${i}`, { isError: i === 7 }));
 	}
 	const target = assistant("done", [], "stop");
 	messages.push(target);
-	const snap = build(messages, target, messages.slice(0, 8).map((_, i) => `c${i + 1}`));
+	const snap = build(messages, target, messages.slice(0, 20).map((_, i) => `c${i + 1}`));
 	const omitted = snap.representation.omitted_evidence_ids as string[];
-	assert.deepEqual(omitted, ["E1", "E2"], "exactly the older, non-retained ids are listed");
-	assert.equal(snap.representation.omitted_observation_count, 2);
-	assert.equal(snap.observations.length, 6);
+	assert.deepEqual(omitted, ["E1", "E2", "E3", "E4", "E5", "E6", "E8"], "exactly the older, non-retained ids are listed");
+	assert.equal(snap.representation.omitted_observation_count, 7);
+	assert.equal(snap.observations.length, 13, "12 most recent results plus the one older error");
+	assert.ok(snap.observations.some((observation) => observation.id === "E7"), "an older error survives its window");
 
 	// Redaction: the secret leaks nowhere, and the mark is REDACTION, not ELISION.
 	const leaky = assistant("used key s3cr3t-key", [{ id: "x", name: "bash", arguments: { apiKey: "s3cr3t-key" } }]);
@@ -255,7 +257,7 @@ test("snapshot: bounded history keeps the MOST RECENT turns and states exact ori
 	const history = snap.representation.history as { text: string; truncated: boolean; chars: number; elided_chars: number; turns: number; turns_omitted: number };
 
 	assert.equal(history.truncated, true);
-	assert.equal(history.chars, 6 * (7 + 4000), "exact original content chars, labels excluded: 6 turns x (`turn N ` + 4000)");
+	assert.equal(history.chars, 6 * (7 + 4000), "exact original content chars: 6 turns x (`turn N ` + 4000)");
 	assert.equal(snap.truncated, false, "a bounded transcript is not a truncated proposal");
 	assert.ok(snap.actorText.length <= config.limits.maxEvidenceChars, "the bound is honored by the bytes");
 	assert.ok(snap.actorText.includes("turn 6"), "newest text survives");

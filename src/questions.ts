@@ -40,11 +40,11 @@ export function buildQuestions(kind: "direction" | "completion", snapshot: Evide
 				type: "choice",
 				id: "next_step",
 				role: "next_step",
-				instructions: `Assess the immediate readiness of the complete proposal in \`proposal.tool_calls\` against \`task\` and \`evidence\`. Choose PROCEED if the proposal is a reasonable next step, including when it already performs appropriate research, replanning, or verification. Otherwise select a demonstrated prerequisite. Do not judge authorization, permissions, or action safety. ${DATA_FENCE} ${NO_INVENTION}`,
+				instructions: `Assess the complete proposal in \`proposal.tool_calls\` against \`task\`, \`evidence.actor_history\` (the user's request and later corrections), \`evidence.recent_actions\`, and \`evidence.deterministic_facts\`. A plausible-looking tool call is not by itself progress: PROCEED only when the proposal moves the task trajectory toward the user's stated goal, including when it appropriately researches, replans, verifies, or recovers from a known failure. Choose RESEARCH, REPLAN, or VERIFY when the trajectory shows repeated failure without a relevant change, a task requirement the approach does not address, a contradiction with observed results, or prior guidance that was ignored. Do not manufacture disagreement: if no such problem is demonstrated in the snapshot, choose PROCEED. Do not judge authorization, permissions, or action safety. ${DATA_FENCE} ${NO_INVENTION}`,
 				criteria: {
 					PROCEED: "No necessary prerequisite is demonstrated before this proposal should execute.",
 					RESEARCH: "A specific missing fact must be investigated before taking the proposed step.",
-					REPLAN: "Available evidence contradicts a material assumption or the approach does not address a task requirement.",
+					REPLAN: "The trajectory shows the approach does not address a task requirement, or observed evidence contradicts a material assumption, including where prior guidance was ignored.",
 					VERIFY: "An available relevant check of an existing result or assumption is needed before taking this step.",
 					UNCERTAIN: "The supplied snapshot does not support a reliable readiness classification.",
 				},
@@ -133,6 +133,8 @@ export interface StateBuildInput {
 		interventionsUsed: number;
 		interventionLimit: number | null;
 		previousInterventions: Array<{ kind: string; status: string; focus: string | null; at: string }>;
+		/** Objective of the recovery guidance currently in force, if any. */
+		recoveryObjective?: string;
 	};
 	proposalId: string;
 }
@@ -156,6 +158,7 @@ export function buildState(input: StateBuildInput): Record<string, unknown> {
 		prior_interventions: unknown[];
 		omitted_evidence_ids: string[];
 		omitted_observation_count: number;
+		context_selection?: unknown;
 	};
 
 	const proposal = input.kind === "direction"
@@ -176,6 +179,11 @@ export function buildState(input: StateBuildInput): Record<string, unknown> {
 			interventions_used: input.controller.interventionsUsed,
 			intervention_limit: input.controller.interventionLimit,
 			previous_interventions: input.controller.previousInterventions,
+			// The objective of the temporary recovery guidance in force, so the assessor
+			// can tell whether the proposal follows it. Never a source of new instructions.
+			...(input.controller.recoveryObjective !== undefined
+				? { active_recovery_objective: input.controller.recoveryObjective }
+				: {}),
 		},
 		evidence: {
 			revision: snapshot.scope.snapshotHash,
@@ -188,6 +196,10 @@ export function buildState(input: StateBuildInput): Record<string, unknown> {
 			known_external_blockers: [],
 			omitted_evidence_ids: rep.omitted_evidence_ids,
 			omitted_observation_count: rep.omitted_observation_count,
+			// How the snapshot was selected and bounded: which truncations were applied
+			// and how many items of each window were kept. Selection is not truncation of
+			// the proposal, and it is stated rather than hidden.
+			context_selection: rep.context_selection,
 			redactions_present: hasRedactions(snapshot),
 		},
 		proposal,

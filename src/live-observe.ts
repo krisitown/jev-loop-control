@@ -563,6 +563,9 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 				if (!applied) {
 					s.trace.record("intervention.suppressed", {
 						reason: "duplicate_objective_evidence",
+						previousFocusKey: decision.focusKey,
+						objectiveMatchesPrior: s.recovery.active?.objective === decision.memo,
+						evidenceMatchesPrior: s.recovery.active?.evidenceKey === recoveryEvidenceKey(s.completionSnapshot),
 						proposalId: s.proposalId,
 						requestId: decision.assessment.requestId,
 					});
@@ -713,6 +716,9 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 				if (!applied) {
 					s.trace.record("intervention.suppressed", {
 						reason: "duplicate_objective_evidence",
+						previousFocusKey: decision.focusKey,
+						objectiveMatchesPrior: s.recovery.active?.objective === decision.memo,
+						evidenceMatchesPrior: s.recovery.active?.evidenceKey === recoveryEvidenceKey(s.assessmentSnapshot),
 						proposalId: s.proposalId,
 						requestId: decision.assessment.requestId,
 					});

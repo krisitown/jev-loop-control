@@ -2,9 +2,11 @@
 
 Pi extension that supervises actor direction and completion with bounded Jev assessments.
 
-Jev checks the actor's proposed tools and completion status, applying bounded interventions when necessary. It works alongside the actor model you already use in Pi: **your configured Pi model stays the actor.** This release does not change that, and it does not claim better output — the effect on quality is not yet measured.
+Jev checks the actor's proposed tools and completion status, applying bounded interventions when necessary. It works alongside the actor model you already use in Pi: **your configured Pi model stays the actor.** This build does not change that, and it does not claim better output — the effect on quality is not yet measured.
 
-**Version:** 0.2.0 (Early Release) · See [CHANGELOG.md](CHANGELOG.md).
+**Version:** 0.3.0 (Unreleased development build, pending validation) · See [CHANGELOG.md](CHANGELOG.md).
+
+The current tree is an unreleased development build. It is not validated, and effectiveness has not been measured. Do not present it as a release.
 
 ## Requirements
 

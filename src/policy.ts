@@ -374,6 +374,9 @@ export interface RepeatedFailure {
 	evidenceIds: string[];
 }
 
+/** Defaults mirrored from config so a partial policy object stays honest. */
+const POLICY_DEFAULTS = { repeatDiagnosticThreshold: 0.85 } as const;
+
 export function repeatedFailureFocus(
 	snapshot: EvidenceSnapshot,
 	config: SupervisorConfig,
@@ -383,13 +386,15 @@ export function repeatedFailureFocus(
 ): RepeatedFailure | null {
 	// The repetition diagnostic is required as corroboration but is never the
 	// trigger on its own: without the measured failures below nothing fires.
-	if (repeat === undefined || repeat < config.policy.repeatDiagnosticThreshold) {
+	const threshold = config.policy?.repeatDiagnosticThreshold ?? POLICY_DEFAULTS.repeatDiagnosticThreshold;
+	if (repeat === undefined || repeat < threshold) {
 		return null;
 	}
 	const executed = snapshot.observations.filter((observation) => observation.provenance === "executed");
 	const groups = new Map<string, RepeatedFailure>();
 	for (const observation of executed.slice(-window)) {
-		if (!observation.ok || observation.argsHash === undefined) {
+		// An explicit error result only: a missing flag is not a measured failure.
+		if (observation.ok !== false || typeof observation.argsHash !== "string" || observation.argsHash === "") {
 			continue;
 		}
 		const key = `${observation.toolName}\u0000${observation.argsHash}`;

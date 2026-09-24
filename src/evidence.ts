@@ -83,9 +83,14 @@ export const OBSERVATION_ARGS_CHARS = 600;
 /** How many of the most recent observations `recent_actions` summarizes. */
 const RECENT_ACTIONS_WINDOW = 24;
 const FACTS_WINDOW = 24;
-/** Retention of results: the most recent N, plus the most recent M errors outside that window. */
+/**
+ * Retention of results: the most recent N, plus the most recent M ERRORS older
+ * than that window. With fewer results than N nothing is omitted at all.
+ */
 const RECENT_RESULTS = 12;
 const ERROR_HISTORY = 2;
+/** `[assistant]: ` / `[user]: ` per-turn labels are formatting, so they are budgeted separately from `chars`. */
+const HISTORY_LABEL_OVERHEAD = 13;
 
 export interface HistoryTurn {
 	role: string;
@@ -169,28 +174,29 @@ export function boundHistory(turns: readonly HistoryTurn[], maxChars: number): B
 	const budget = Math.max(0, maxChars - reserve);
 	const kept: string[] = [];
 	let used = 0;
-	let turnsOmitted = 0;
+	let boundary = 0;
 	for (let index = rendered.length - 1; index >= 0; index--) {
 		const piece = rendered[index]!;
 		const cost = kept.length === 0 ? piece.length : piece.length + 2;
 		if (used + cost <= budget) {
 			kept.unshift(piece);
 			used += cost;
+			boundary = index;
 			continue;
 		}
 		// Boundary turn: keep its most recent characters, then everything older is out.
 		const room = budget - used - (kept.length === 0 ? 0 : 2);
 		if (room > 0) {
 			kept.unshift(piece.slice(piece.length - room));
+			boundary = index;
 		}
-		turnsOmitted = index;
 		break;
 	}
-	turnsOmitted += turns.length - 1 - (kept.length === 0 ? rendered.length : rendered.indexOf(kept[0]!));
 	const body = kept.join("\n\n");
+	// Exact arithmetic: the rendered transcript minus what survived is what was dropped.
 	const elided = Math.max(0, joined.length - body.length);
 	const marker = `${ELISION_MARK} ${elided} characters elided ${ELISION_MARK}\n`;
-	return { text: `${marker}${body}`, truncated: true, chars, elided_chars: elided, turns: turns.length, turns_omitted: turnsOmitted };
+	return { text: `${marker}${body}`, truncated: true, chars, elided_chars: elided, turns: turns.length, turns_omitted: boundary };
 }
 
 export function isToolResultMessage(message: Msg | undefined): boolean {
@@ -448,16 +454,16 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 			...(found ? { arguments: found.arguments, argsHash: found.argsHash } : {}),
 		});
 	}
-	// Retention: the 12 most recent results, plus the 2 most recent ERRORS that
-	// fall outside that window, so a failure is never forgotten just because the
-	// actor kept working. Ids are positional, so a dropped older observation still
-	// shows up in `omitted_evidence_ids` by its original id.
-	const lastWindow = observationsAll.slice(-RECENT_RESULTS);
-	const lastIds = new Set(lastWindow.map((observation) => observation.id));
-	const errorsOutside = observationsAll.filter((observation) => !observation.ok && !lastIds.has(observation.id)).slice(-ERROR_HISTORY);
+	// Retention: the most recent RECENT_RESULTS results, plus the most recent
+	// ERROR_HISTORY errors that fall outside that window, so a failure is never
+	// forgotten just because the actor kept working. Ids are positional, so an
+	// omitted observation is still reported under its original id.
+	const lastWindowStart = Math.max(0, observationsAll.length - RECENT_RESULTS);
+	const lastIds = new Set(observationsAll.slice(lastWindowStart).map((observation) => observation.id));
+	const olderErrors = observationsAll.filter((observation, index) => index < lastWindowStart && !observation.ok).slice(-ERROR_HISTORY);
 	const keptPositions = new Set<number>([
-		...lastWindow.map((observation) => observationsAll.indexOf(observation)),
-		...errorsOutside.map((observation) => observationsAll.indexOf(observation)),
+		...observationsAll.slice(lastWindowStart).map((observation) => observationsAll.indexOf(observation)),
+		...olderErrors.map((observation) => observationsAll.indexOf(observation)),
 	]);
 	const retained = observationsAll.filter((_, index) => keptPositions.has(index));
 	const omittedObservationIds = observationsAll.filter((_, index) => !keptPositions.has(index)).map((observation) => observation.id);
@@ -485,7 +491,8 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 			historyTurns.push({ role: message.role, text });
 		}
 	}
-	const history = boundHistory(historyTurns, input.config.limits.maxEvidenceChars);
+	const historyBudget = Math.max(0, input.config.limits.maxEvidenceChars - HISTORY_LABEL_OVERHEAD * Math.max(1, historyTurns.length));
+	const history = boundHistory(historyTurns, historyBudget);
 	const toolCalls = snapshotToolCalls(input.target, scrub);
 	const facts = deterministicFacts(input.messages, input.executedToolCallIds, scrub);
 	const priorInterventions = input.priorInterventions.slice(-5).map((entry) => ({ kind: scrub(entry.kind), at: entry.at, focus: scrub(entry.focus) }));
@@ -502,6 +509,10 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 			text: history.text,
 			truncated: history.truncated,
 			chars: history.chars,
+			rendered_chars: history.truncated ? history.chars + HISTORY_LABEL_OVERHEAD * history.turns + 2 * Math.max(0, history.turns - 1) : history.text.length,
+			elided_chars: history.elided_chars,
+			turns: history.turns,
+			turns_omitted: history.turns_omitted,
 		},
 		proposal: {
 			kind: input.kind,
