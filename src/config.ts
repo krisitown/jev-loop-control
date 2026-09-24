@@ -41,10 +41,10 @@ export interface JevSection {
 }
 
 export interface BudgetSection {
-	/** Hard cap on dispatched Jev requests per session. Must be finite. */
-	maxRequests: number;
-	/** Project-specific spending allowance in USD. Zero means "no live calls". */
-	allowanceUsd: number;
+	/** Hard cap on dispatched Jev requests per session. null means unlimited. */
+	maxRequests: number | null;
+	/** Project-specific spending allowance in USD. null means unlimited. */
+	allowanceUsd: number | null;
 	/** Conservative reservation per dispatched request when cost is unknown. */
 	reserveUsdPerRequest: number;
 }
@@ -71,7 +71,8 @@ export const POLICY_INVARIANTS = Object.freeze({
 export interface LimitSection {
 	maxInterventionsPerTask: number;
 	maxTerminalContinuations: number;
-	maxAssessments: number;
+	/** Hard cap on assessments per session. null means unlimited. */
+	maxAssessments: number | null;
 	/** How many finalized proposals may be in flight before they are dropped. */
 	proposalLease: number;
 	/** Character budget for the evidence block. */
@@ -115,10 +116,10 @@ export function defaultConfig(): SupervisorConfig {
 	return {
 		version: 1,
 		configPath: null,
-		mode: "off",
+		mode: "enforce",
 		modeSource: "default",
 		jev: {
-			enabled: false,
+			enabled: true,
 			endpoint: DEFAULT_ENDPOINTS.vercelTypesafe,
 			model: "typesafe-ai/jev",
 			apiKeyEnv: "AI_GATEWAY_API_KEY",
@@ -126,7 +127,7 @@ export function defaultConfig(): SupervisorConfig {
 			maxResponseBytes: 262_144,
 			maxRequestBytes: 49_152,
 		},
-		budget: { maxRequests: 0, allowanceUsd: 0, reserveUsdPerRequest: 0.01 },
+		budget: { maxRequests: null, allowanceUsd: null, reserveUsdPerRequest: 0.01 },
 		policy: {
 			probabilityThreshold: 0.8,
 			gapThreshold: 0.2,
@@ -135,7 +136,7 @@ export function defaultConfig(): SupervisorConfig {
 		limits: {
 			maxInterventionsPerTask: 3,
 			maxTerminalContinuations: 2,
-			maxAssessments: 30,
+			maxAssessments: null,
 			proposalLease: 2,
 			maxEvidenceChars: 12_000,
 			maxProposalChars: 60_000,
@@ -236,6 +237,29 @@ class Reader {
 		return raw;
 	}
 
+	nullableNumber(section: Record<string, unknown>, path: string, key: string, fallback: number | null, range: { min: number; max: number; integer?: boolean }): number | null {
+		const raw = section[key];
+		if (raw === undefined) {
+			return fallback;
+		}
+		if (raw === null) {
+			return null;
+		}
+		if (typeof raw !== "number" || !Number.isFinite(raw)) {
+			this.fail(`${path}.${key}`, "expected a finite number or null");
+			return fallback;
+		}
+		if (range.integer && !Number.isInteger(raw)) {
+			this.fail(`${path}.${key}`, `must be an integer, got ${raw}`);
+			return fallback;
+		}
+		if (raw < range.min || raw > range.max) {
+			this.fail(`${path}.${key}`, `must be between ${range.min} and ${range.max}, got ${raw}`);
+			return fallback;
+		}
+		return raw;
+	}
+
 	boolean(section: Record<string, unknown>, path: string, key: string, fallback: boolean): boolean {
 		const raw = section[key];
 		if (raw === undefined) {
@@ -281,11 +305,16 @@ class Reader {
 		const value = this.string(section, path, key, fallback);
 		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
 			// Shape only: the value may itself be a credential.
-			this.fail(`${path}.${key}`, "must be an environment variable NAME (letters, digits, underscore, longer than 3 characters)");
+			this.fail(`${path}.${key}`, "expected environment variable name such as AI_GATEWAY_API_KEY, not an API key");
 			return fallback;
 		}
 		if (value.length <= 3 || value.length > 128 || value.includes("=")) {
-			this.fail(`${path}.${key}`, "does not look like an environment variable name");
+			this.fail(`${path}.${key}`, "expected environment variable name such as AI_GATEWAY_API_KEY, not an API key");
+			return fallback;
+		}
+		// Reject credential-shaped values that might pass the regex check
+		if (/^(vck_|sk-|ghp_|github_pat_)/.test(value)) {
+			this.fail(`${path}.${key}`, "expected environment variable name such as AI_GATEWAY_API_KEY, not an API key");
 			return fallback;
 		}
 		return value;
@@ -380,8 +409,8 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, io
 	if (budget) {
 		reader.checkKeys({ path: "budget", value: budget, allowed: ["maxRequests", "allowanceUsd", "reserveUsdPerRequest"] });
 		config.budget = {
-			maxRequests: reader.number(budget, "budget", "maxRequests", base.budget.maxRequests, { min: 0, max: 100_000, integer: true }),
-			allowanceUsd: reader.number(budget, "budget", "allowanceUsd", base.budget.allowanceUsd, { min: 0, max: 10_000 }),
+			maxRequests: reader.nullableNumber(budget, "budget", "maxRequests", base.budget.maxRequests, { min: 0, max: 100_000, integer: true }),
+			allowanceUsd: reader.nullableNumber(budget, "budget", "allowanceUsd", base.budget.allowanceUsd, { min: 0, max: 10_000 }),
 			reserveUsdPerRequest: reader.number(budget, "budget", "reserveUsdPerRequest", base.budget.reserveUsdPerRequest, { min: 0, max: 10 }),
 		};
 	}
@@ -402,7 +431,7 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, io
 		config.limits = {
 			maxInterventionsPerTask: reader.number(limits, "limits", "maxInterventionsPerTask", base.limits.maxInterventionsPerTask, { min: 0, max: 100, integer: true }),
 			maxTerminalContinuations: reader.number(limits, "limits", "maxTerminalContinuations", base.limits.maxTerminalContinuations, { min: 0, max: 100, integer: true }),
-			maxAssessments: reader.number(limits, "limits", "maxAssessments", base.limits.maxAssessments, { min: 0, max: 1000, integer: true }),
+			maxAssessments: reader.nullableNumber(limits, "limits", "maxAssessments", base.limits.maxAssessments, { min: 0, max: 1000, integer: true }),
 			proposalLease: reader.number(limits, "limits", "proposalLease", base.limits.proposalLease, { min: 1, max: 10, integer: true }),
 			maxEvidenceChars: reader.number(limits, "limits", "maxEvidenceChars", base.limits.maxEvidenceChars, { min: 500, max: 200_000, integer: true }),
 			maxProposalChars: reader.number(limits, "limits", "maxProposalChars", base.limits.maxProposalChars, { min: 1000, max: 1_000_000, integer: true }),
@@ -449,17 +478,12 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, io
 	if (config.mode === "enforce" && config.limits.maxTerminalContinuations === 0) {
 		reader.notice("enforce mode with maxTerminalContinuations=0 can only block tools, never continue a task");
 	}
-	if (config.jev.enabled) {
-		// Any hosted assessment needs an explicit project allowance and a finite
-		// request cap, in observe mode as well as enforce.
-		if (config.mode !== "off" && config.budget.allowanceUsd <= 0) {
-			reader.fail("budget.allowanceUsd", `live Jev assessment in ${config.mode} mode requires a project-specific nonzero spending allowance`);
-		}
-		if (config.budget.maxRequests === 0) {
-			reader.fail("budget.maxRequests", "jev.enabled is true but maxRequests is 0; no assessment could ever be dispatched");
-		}
-		if (config.budget.reserveUsdPerRequest <= 0) {
-			reader.fail("budget.reserveUsdPerRequest", "providers may omit cost metadata, so a positive per-request reservation is required to keep the allowance honest");
+	if (config.jev.enabled && config.mode !== "off") {
+		// Monetary reservation is only strictly required if a monetary cap is configured.
+		// If allowanceUsd is null (unlimited), we don't enforce a positive reserve for budget integrity,
+		// though the default is still positive.
+		if (config.budget.allowanceUsd !== null && config.budget.reserveUsdPerRequest <= 0) {
+			reader.fail("budget.reserveUsdPerRequest", "providers may omit cost metadata, so a positive per-request reservation is required when a spending allowance is configured");
 		}
 		if (!env[config.jev.apiKeyEnv]) {
 			reader.fail("jev.apiKeyEnv", `$${config.jev.apiKeyEnv} is not set in this environment`);

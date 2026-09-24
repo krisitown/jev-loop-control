@@ -1,8 +1,8 @@
 /**
  * jev-loop-control — Pi extension entry point.
  *
+ * Live mode is default unless JEV_LOOP_CONTROL_TRACE is explicitly set (legacy).
  * JEV_LOOP_CONTROL_CONFIG selects live off/observe/enforce modes with Jev.
- * Without it, legacy lifecycle diagnostics default off.
  */
 
 import { appendFileSync } from "node:fs";
@@ -123,8 +123,8 @@ function describeMessage(message: unknown): Record<string, unknown> {
 }
 
 export default function jevLoopControl(pi: ExtensionAPI): void {
-	// Live-observe path: explicit config file triggers real Jev integration (legacy diagnostic path skipped).
-	if (process.env.JEV_LOOP_CONTROL_CONFIG) {
+	// Live-observe path: default unless explicit legacy TRACE is set.
+	if (process.env.JEV_LOOP_CONTROL_CONFIG || !process.env.JEV_LOOP_CONTROL_TRACE) {
 		liveObserve(pi);
 		return;
 	}

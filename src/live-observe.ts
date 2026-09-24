@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, isAbsolute } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadConfig, type SupervisorConfig } from "./config.ts";
 import { createHttpClient } from "./jev.ts";
@@ -10,6 +10,7 @@ import { TraceStore, defaultRunsDir, runId } from "./trace.ts";
 import { makeScrub, redactValue } from "./redact.ts";
 import type { Assessment, BudgetState, Decision, EvidenceSnapshot, Question } from "./types.ts";
 import { applyCompletionContinuation, applyDirectionBlock } from "./interventions.ts";
+import { assessmentBudgetReason } from "./budget.ts";
 import type { ToolCallEventResult, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 
 interface LiveState {
@@ -49,21 +50,48 @@ interface LiveState {
 
 export function liveObserve(pi: ExtensionAPI): void {
 	let state: LiveState | undefined;
+	let activation = { reason: "session not started", configPath: "", cwd: "", mode: "off", enabled: false, hint: "apiKeyEnv must name an environment variable such as AI_GATEWAY_API_KEY. Export that variable before launching Pi; restart after environment changes." };
+	let activationScrub = makeScrub([]);
 
 	pi.on("session_start", (_event, ctx) => {
 		state = undefined;
 		const { config, problems, notices } = loadConfig(ctx.cwd);
-		if (config.mode === "off" || !config.jev.enabled) {
-			console.error(`jev-loop-control: mode=${config.mode}, jev.enabled=${config.jev.enabled}; no live assessments`);
+		activationScrub = makeScrub([process.env[config.jev.apiKeyEnv] ?? ""]);
+		activation.hint = "apiKeyEnv must name an environment variable such as AI_GATEWAY_API_KEY. Export that variable before launching Pi; restart after environment changes.";
+
+		const envConfigPath = process.env.JEV_LOOP_CONTROL_CONFIG;
+		const trimmedEnvPath = envConfigPath ? envConfigPath.trim() : "";
+		const resolvedConfigPath = trimmedEnvPath ? resolve(ctx.cwd, trimmedEnvPath) : (config.configPath || "(built-in defaults)");
+
+		activation.configPath = resolvedConfigPath;
+		activation.cwd = ctx.cwd;
+		activation.mode = config.mode;
+		activation.enabled = config.jev.enabled;
+
+		if (problems.length > 0) {
+			activation.reason = problems.join("; ");
+			const msg = `jev-loop-control: configuration problems: ${problems.join("; ")}`;
+			if (ctx.hasUI) ctx.ui.notify(activationScrub(msg), "warning");
+			else console.error(activationScrub(msg));
 			return;
 		}
-		if (problems.length > 0) {
-			console.error(`jev-loop-control: configuration problems: ${problems.join("; ")}`);
+		if (config.mode === "off") {
+			activation.reason = "mode is off";
+			activation.hint = "Set mode to observe or enforce";
+			console.error(`jev-loop-control: mode=off; no live assessments`);
+			return;
+		}
+		if (!config.jev.enabled) {
+			activation.reason = "jev disabled";
+			activation.hint = "Enable jev in config";
+			console.error(`jev-loop-control: jev.enabled=false; no live assessments`);
 			return;
 		}
 
 		const apiKey = process.env[config.jev.apiKeyEnv];
 		if (!apiKey) {
+			activation.reason = `missing ${config.jev.apiKeyEnv}`;
+			activation.hint = `Export ${config.jev.apiKeyEnv} as environment variable and restart Pi`;
 			console.error(`jev-loop-control: ${config.jev.apiKeyEnv} not set; live assessments disabled`);
 			return;
 		}
@@ -118,6 +146,7 @@ export function liveObserve(pi: ExtensionAPI): void {
 			completionSignal: undefined,
 		};
 
+		activation.reason = "";
 		trace.manifest({ configPath: config.configPath, mode: config.mode, runId: runIdStr });
 		console.error(`jev-loop-control: ${config.mode} active, run dir: ${traceDir}`);
 	});
@@ -231,13 +260,13 @@ export function liveObserve(pi: ExtensionAPI): void {
 			return applyToolCallDecision(s, decision, event, ctx);
 		}
 
-		const canAssess = s.requirements.length > 0 &&
-			s.budget.requestsUsed < s.config.budget.maxRequests &&
-			s.assessmentsUsed < s.config.limits.maxAssessments &&
-			s.budget.billedUsd + s.budget.reservedUsd + s.config.budget.reserveUsdPerRequest <= s.config.budget.allowanceUsd;
-
-		if (!canAssess) {
-			s.trace.record("assessment_skipped", { reason: "budget_or_requirements" });
+		const budgetReason = assessmentBudgetReason(s.config, s.budget, s.assessmentsUsed);
+		if (s.requirements.length === 0) {
+			s.trace.record("assessment_skipped", { reason: "missing_requirements" });
+			return undefined;
+		}
+		if (budgetReason) {
+			s.trace.record("assessment_skipped", { reason: budgetReason });
 			return undefined;
 		}
 
@@ -337,13 +366,13 @@ export function liveObserve(pi: ExtensionAPI): void {
 			if (!s.completionAssessed) {
 				s.completionAssessed = true;
 
-				const canAssess = s.requirements.length > 0 &&
-					s.budget.requestsUsed < s.config.budget.maxRequests &&
-					s.assessmentsUsed < s.config.limits.maxAssessments &&
-					s.budget.billedUsd + s.budget.reservedUsd + s.config.budget.reserveUsdPerRequest <= s.config.budget.allowanceUsd;
-
-				if (!canAssess) {
-					s.trace.record("assessment_skipped", { reason: "budget_or_requirements" });
+				const budgetReason = assessmentBudgetReason(s.config, s.budget, s.assessmentsUsed);
+				if (s.requirements.length === 0) {
+					s.trace.record("assessment_skipped", { reason: "missing_requirements" });
+					return;
+				}
+				if (budgetReason) {
+					s.trace.record("assessment_skipped", { reason: budgetReason });
 					return;
 				}
 
@@ -491,19 +520,30 @@ export function liveObserve(pi: ExtensionAPI): void {
 		description: "Show jev-loop-control status",
 		handler: async (_args, ctx) => {
 			if (!state) {
-				if (ctx.hasUI) ctx.ui.notify("jev-loop-control: not active");
-				else console.error("jev-loop-control: not active");
+				const info = { active: false, ...activation };
+				const scrubbed = activationScrub(JSON.stringify(info, null, 2));
+				if (ctx.hasUI) ctx.ui.notify(scrubbed);
+				else console.error(scrubbed);
 				return;
 			}
 			const status = {
+				active: true,
 				mode: state.config.mode,
+				configPath: activation.configPath,
+				cwd: activation.cwd,
+				limits: {
+					maxRequests: state.config.budget.maxRequests,
+					allowanceUsd: state.config.budget.allowanceUsd,
+					maxAssessments: state.config.limits.maxAssessments,
+				},
 				requests: state.budget.requestsUsed,
 				assessments: state.assessmentsUsed,
 				budget: state.budget,
 				traceDir: state.trace.dir,
 			};
-			if (ctx.hasUI) ctx.ui.notify(JSON.stringify(status, null, 2));
-			else console.error(JSON.stringify(status, null, 2));
+			const scrubbed = activationScrub(JSON.stringify(status, null, 2));
+			if (ctx.hasUI) ctx.ui.notify(scrubbed);
+			else console.error(scrubbed);
 		},
 	});
 
@@ -543,8 +583,10 @@ export function liveObserve(pi: ExtensionAPI): void {
 		description: "Show jev-loop-control trace path",
 		handler: async (_args, ctx) => {
 			if (!state) {
-				if (ctx.hasUI) ctx.ui.notify("jev-loop-control: not active");
-				else console.error("jev-loop-control: not active");
+				const info = { active: false, ...activation };
+				const scrubbed = activationScrub(JSON.stringify(info, null, 2));
+				if (ctx.hasUI) ctx.ui.notify(scrubbed);
+				else console.error(scrubbed);
 				return;
 			}
 			if (ctx.hasUI) ctx.ui.notify(state.trace.dir);

@@ -4,12 +4,11 @@ import { loadConfig, defaultConfig, describeConfig, CONFIG_PATH_ENV, MODE_ENV } 
 
 /**
  * Config validation regressions. The loader must be strict without being
- * clever: unknown/bad/null fields are rejected, live inference is impossible
- * without an explicit budget, and a diagnostic message never echoes back a
- * raw invalid value (which may itself be a credential).
+ * clever: unknown/bad/null fields are rejected, and a diagnostic message never
+ * echoes back a raw invalid value (which may itself be a credential).
  */
 
-function load(json: unknown, env: Record<string, string> = {}, options: { read?: (p: string) => string; exists?: (p: string) => boolean } = {}) {
+function load(json: unknown, env: Record<string, string> = { AI_GATEWAY_API_KEY: "synthetic-key" }, options: { read?: (p: string) => string; exists?: (p: string) => boolean } = {}) {
 	const text = typeof json === "string" ? json : JSON.stringify(json);
 	return loadConfig("/project", { [CONFIG_PATH_ENV]: "/project/jev-loop-control.config.json", ...env }, {
 		read: options.read ?? (() => text),
@@ -17,16 +16,23 @@ function load(json: unknown, env: Record<string, string> = {}, options: { read?:
 	});
 }
 
-test("defaults: mode off, live disabled, no env needed", () => {
+test("defaults: mode enforce, live enabled, unlimited caps", () => {
 	const base = defaultConfig();
-	assert.equal(base.mode, "off");
+	assert.equal(base.mode, "enforce");
 	assert.equal(base.modeSource, "default");
-	assert.equal(base.jev.enabled, false);
-	assert.equal(base.budget.allowanceUsd, 0);
-	// An empty project with no config file is the default: off, no problems.
-	const result = loadConfig("/empty", {}, { read: () => { throw new Error("must not read"); }, exists: () => false });
+	assert.equal(base.jev.enabled, true);
+	assert.equal(base.budget.allowanceUsd, null);
+	assert.equal(base.budget.maxRequests, null);
+	assert.equal(base.limits.maxAssessments, null);
+
+	// An empty project with no config file is the default: enforce, valid if key present.
+	const result = loadConfig("/empty", { AI_GATEWAY_API_KEY: "synthetic-key" }, { read: () => { throw new Error("must not read"); }, exists: () => false });
 	assert.deepEqual(result.problems, []);
-	assert.equal(result.config.mode, "off");
+	assert.equal(result.config.mode, "enforce");
+
+	// Without key, it fails validation for missing key.
+	const noKey = loadConfig("/empty", {}, { read: () => { throw new Error("must not read"); }, exists: () => false });
+	assert.ok(noKey.problems.some((p) => p.includes("AI_GATEWAY_API_KEY") && p.includes("not set")));
 });
 
 test("unknown keys and wrong types are rejected", () => {
@@ -49,7 +55,7 @@ test("taskManifestPath: explicit null is legal, paths resolve, missing files fai
 	assert.equal(explicitNull.config.taskManifestExplicit, true);
 	assert.equal(explicitNull.config.taskManifestPath, null);
 
-	const rel = load({ taskManifestPath: "task.json" }, {}, { exists: (p) => !p.endsWith("gone.json") });
+	const rel = load({ taskManifestPath: "task.json" }, { AI_GATEWAY_API_KEY: "synthetic-key" }, { exists: (p) => !p.endsWith("gone.json") });
 	assert.deepEqual(rel.problems, []);
 	assert.equal(rel.config.taskManifestPath, "/project/task.json");
 	assert.equal(rel.config.taskManifestExplicit, true);
@@ -86,38 +92,85 @@ test("invalid values are never reflected in problems, even when they look like s
 });
 
 test("apiKeyEnv accepts a variable NAME only, never a key value", () => {
-	const ok = load({ jev: { apiKeyEnv: "MY_GATEWAY_KEY", enabled: false } });
+	const ok = load({ jev: { apiKeyEnv: "MY_JEV_KEY", enabled: false } });
 	assert.deepEqual(ok.problems, []);
-	assert.equal(ok.config.jev.apiKeyEnv, "MY_GATEWAY_KEY");
-	const looksLikeKey = load({ jev: { apiKeyEnv: "sk-live-abcdef0123456789" } });
-	assert.ok(looksLikeKey.problems.some((p) => p.includes("environment variable NAME")));
-	assert.ok(!JSON.stringify(looksLikeKey.problems).includes("abcdef0123456789"));
+	assert.equal(ok.config.jev.apiKeyEnv, "MY_JEV_KEY");
+
+	// Test credential-shaped values are rejected
+	const syntheticKey = "vck_not_a_real_key_for_tests";
+	const looksLikeKey = load({ jev: { apiKeyEnv: syntheticKey } });
+	assert.ok(looksLikeKey.problems.some((p) => p.includes("expected environment variable name such as AI_GATEWAY_API_KEY, not an API key")));
+	assert.ok(!JSON.stringify(looksLikeKey.problems).includes(syntheticKey), "raw value must not appear in problems");
+	assert.ok(!JSON.stringify(describeConfig(looksLikeKey.config)).includes(syntheticKey), "raw value must not appear in describeConfig");
+
+	// Verify fallback to default when rejected
+	assert.equal(looksLikeKey.config.jev.apiKeyEnv, "AI_GATEWAY_API_KEY");
 });
 
-test("live observe AND enforce both require enabled plus positive allowance/reservation and a finite nonzero cap", () => {
+test("live observe AND enforce require enabled and API key; budgets are optional", () => {
 	for (const mode of ["observe", "enforce"] as const) {
-		const noAllowance = load({ mode, jev: { enabled: true }, budget: { maxRequests: 5, allowanceUsd: 0, reserveUsdPerRequest: 0.01 } }, { AI_GATEWAY_API_KEY: "present" });
-		assert.ok(noAllowance.problems.some((p) => p.includes("allowanceUsd") && p.includes("nonzero")), `${mode}: ${noAllowance.problems.join(";")}`);
+		// No budget specified -> unlimited, valid if key present
+		const noBudget = load({ mode, jev: { enabled: true } }, { AI_GATEWAY_API_KEY: "present" });
+		assert.deepEqual(noBudget.problems, []);
+		assert.equal(noBudget.config.budget.maxRequests, null);
+		assert.equal(noBudget.config.budget.allowanceUsd, null);
 
-		const zeroCap = load({ mode, jev: { enabled: true }, budget: { maxRequests: 0, allowanceUsd: 1, reserveUsdPerRequest: 0.01 } }, { AI_GATEWAY_API_KEY: "present" });
-		assert.ok(zeroCap.problems.some((p) => p.includes("maxRequests")));
+		// Partial budget: maxRequests only
+		const partialBudget = load({ mode, jev: { enabled: true }, budget: { maxRequests: 5 } }, { AI_GATEWAY_API_KEY: "present" });
+		assert.deepEqual(partialBudget.problems, []);
+		assert.equal(partialBudget.config.budget.maxRequests, 5);
+		assert.equal(partialBudget.config.budget.allowanceUsd, null);
+		assert.equal(partialBudget.config.limits.maxAssessments, null);
 
-		const noReservation = load({ mode, jev: { enabled: true }, budget: { maxRequests: 5, allowanceUsd: 1, reserveUsdPerRequest: 0 } }, { AI_GATEWAY_API_KEY: "present" });
-		assert.ok(noReservation.problems.some((p) => p.includes("reserveUsdPerRequest")));
+		// Explicit zero budget -> valid (stops calls)
+		const zeroBudget = load({ mode, jev: { enabled: true }, budget: { maxRequests: 0, allowanceUsd: 0 } }, { AI_GATEWAY_API_KEY: "present" });
+		assert.deepEqual(zeroBudget.problems, []);
+		assert.equal(zeroBudget.config.budget.maxRequests, 0);
 
-		const noKey = load({ mode, jev: { enabled: true }, budget: { maxRequests: 5, allowanceUsd: 1, reserveUsdPerRequest: 0.01 } }, {});
+		// Missing key -> fatal
+		const noKey = load({ mode, jev: { enabled: true } }, {});
 		assert.ok(noKey.problems.some((p) => p.includes("AI_GATEWAY_API_KEY") && p.includes("not set")));
-
-		const good = load({ mode, jev: { enabled: true }, budget: { maxRequests: 5, allowanceUsd: 1, reserveUsdPerRequest: 0.01 } }, { AI_GATEWAY_API_KEY: "present" });
-		assert.deepEqual(good.problems, []);
-		assert.equal(good.config.mode, mode);
 	}
 });
 
-test("enabled never infers a budget: defaults plus enabled still fail", () => {
-	const r = load({ mode: "enforce", jev: { enabled: true } }, { AI_GATEWAY_API_KEY: "present" });
-	assert.ok(r.problems.some((p) => p.includes("allowanceUsd")));
-	assert.ok(r.problems.some((p) => p.includes("maxRequests")));
+test("budget validation: negative numbers rejected", () => {
+	const r = load({ budget: { maxRequests: -1 } });
+	assert.ok(r.problems.some((p) => p.includes("maxRequests") && p.includes("between")));
+	const r2 = load({ budget: { allowanceUsd: -0.1 } });
+	assert.ok(r2.problems.some((p) => p.includes("allowanceUsd") && p.includes("between")));
+});
+
+test("limits.maxAssessments: explicit 0 and null are valid", () => {
+	const zero = load({ limits: { maxAssessments: 0 } });
+	assert.deepEqual(zero.problems, []);
+	assert.equal(zero.config.limits.maxAssessments, 0);
+
+	const nullVal = load({ limits: { maxAssessments: null } });
+	assert.deepEqual(nullVal.problems, []);
+	assert.equal(nullVal.config.limits.maxAssessments, null);
+});
+
+test("budget.reserveUsdPerRequest: zero disallowed only when monetary cap provided", () => {
+	// With allowanceUsd set, reserve must be positive
+	const withCap = load({ jev: { enabled: true }, budget: { allowanceUsd: 1.0, reserveUsdPerRequest: 0 } }, { AI_GATEWAY_API_KEY: "present" });
+	assert.ok(withCap.problems.some((p) => p.includes("reserveUsdPerRequest") && p.includes("positive")));
+
+	// Without allowanceUsd (unlimited), reserve can be 0
+	const noCap = load({ jev: { enabled: true }, budget: { allowanceUsd: null, reserveUsdPerRequest: 0 } }, { AI_GATEWAY_API_KEY: "present" });
+	assert.deepEqual(noCap.problems, []);
+	assert.equal(noCap.config.budget.reserveUsdPerRequest, 0);
+});
+
+test("budget validation: strings rejected", () => {
+	const r = load({ budget: { maxRequests: "5" } });
+	assert.ok(r.problems.some((p) => p.includes("maxRequests") && p.includes("finite number or null")));
+});
+
+test("budget validation: null is unlimited", () => {
+	const r = load({ budget: { maxRequests: null, allowanceUsd: null } });
+	assert.deepEqual(r.problems, []);
+	assert.equal(r.config.budget.maxRequests, null);
+	assert.equal(r.config.budget.allowanceUsd, null);
 });
 
 test("mode: environment overrides file; an invalid env mode is fatal, not downgraded quietly", () => {
@@ -151,4 +204,10 @@ test("configured config file that does not exist is fatal and stops the read", (
 test("unsupported config version is rejected", () => {
 	const r = load({ version: 2 });
 	assert.ok(r.problems.some((p) => p.startsWith("version")));
+});
+
+test("explicit off mode is valid without API key", () => {
+	const r = load({ mode: "off", jev: { enabled: true } }, {});
+	assert.deepEqual(r.problems, []);
+	assert.equal(r.config.mode, "off");
 });

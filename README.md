@@ -19,7 +19,7 @@ Install Pi globally:
 npm install -g @earendil-works/pi-coding-agent@0.87.1
 ```
 
-Install this extension via Git:
+Install this extension via Git in a normal terminal:
 
 ```bash
 pi install git:github.com/krisitown/jev-loop-control
@@ -27,47 +27,64 @@ pi install git:github.com/krisitown/jev-loop-control
 
 *Note: This package is not available on npm. Do not use `npm install jev-loop-control`.*
 
+**Important:** Install first. Wrappers adding provider flags before `install` break the command. Run `/reload` or restart Pi after installation.
+
+For local development, cloning alone is not installation. Use:
+
+```bash
+pi install /absolute/path/to/jev-loop-control
+```
+
+See [Pi packages](https://pi.dev/docs/latest/packages) and [Pi extensions](https://pi.dev/docs/latest/extensions).
+
 ## Quickstart
 
 In your target project directory:
 
-1. Download the example configuration:
-   ```bash
-   curl -fsSL https://raw.githubusercontent.com/krisitown/jev-loop-control/main/jev-loop-control.config.example.json -o jev-loop-control.config.json
-   ```
-
-2. Set the configuration path (REQUIRED):
-   ```bash
-   export JEV_LOOP_CONTROL_CONFIG="$PWD/jev-loop-control.config.json"
-   ```
-
-3. Set your API key:
+1. Set your API key:
    ```bash
    export AI_GATEWAY_API_KEY="your-vercel-ai-gateway-key"
    ```
 
-4. Start Pi:
+2. Start Pi:
    ```bash
    pi
    ```
+
+**No config download or `JEV_LOOP_CONTROL_CONFIG` export is required.**
+
+If Pi is already running, restart it after exporting the environment variable.
+
+Verify activation:
+- `/jev-status`: Should show `active: true`, `mode: enforce`, and `limits: { maxRequests: null, allowanceUsd: null, maxAssessments: null }`.
+- `/jev-trace`: Shows the path to the current run's trace directory.
 
 **Important:** `.env` files are not automatically loaded. You must explicitly export environment variables or source your own trusted `.env` file before starting Pi.
 
 ## Configuration
 
-The example configuration enables `observe` mode with a budget of 8 calls, $0.10 allowance, and $0.01 reserve per request. Jev charges are separate from the actor's costs. The reserve is an estimate, not a guaranteed billing cap.
+The extension automatically discovers `jev-loop-control.config.json` in the current project directory. You can override this path with `JEV_LOOP_CONTROL_CONFIG`.
 
-### Modes
+**Defaults:**
+- **Mode:** `enforce` (active supervision).
+- **Budgets:** Unlimited requests, spend, and assessments by default.
+- **Safeguards:** Per-task limits remain active (3 interventions, 2 terminal continuations) to prevent infinite loops.
 
-- **off**: No supervision.
-- **observe**: Logs decisions and traces but does not intervene.
-- **enforce**: Blocks tool batches with strong directional verdicts or requests bounded continuations for unfinished completions.
+### Existing Configs
 
-To change modes, edit `jev-loop-control.config.json` or set the environment variable:
+If you have an existing `jev-loop-control.config.json`, it **overrides** these defaults. Old settings (e.g., `mode: observe`, `maxRequests: 8`) remain in effect until you edit or remove the file. Raw key fields are rejected, not valid overrides.
+
+To adopt the new defaults, rename or omit the config file, or adjust fields to remove caps.
+
+### Optional Overrides
+
+You can override the mode via environment variable:
 
 ```bash
-JEV_LOOP_CONTROL_MODE=enforce pi
+JEV_LOOP_CONTROL_MODE=observe pi
 ```
+
+Valid modes: `enforce`, `observe`, `off`.
 
 ### Endpoints and API
 
@@ -76,7 +93,39 @@ The default configuration uses the Vercel AI Gateway TypeSafe-compatible API. Yo
 Default endpoint: `https://ai-gateway.vercel.sh/typesafe/v1/systemone`
 Default model: `typesafe-ai/jev`
 
+`jev.apiKeyEnv` is the **NAME** of the environment variable containing the key, not the key itself. Example:
+
+```json
+{
+  "jev": {
+    "apiKeyEnv": "AI_GATEWAY_API_KEY"
+  }
+}
+```
+
+The actual key value must be exported or sourced before launching Pi. `.env` files are not automatically loaded. A restart is needed after changing environment variables.
+
 Your configured Pi model remains the actor. Bounded proposal/evidence is sent to the configured Jev endpoint; traces remain local.
+
+### Optional Budget Limits
+
+To limit costs, add a `budget` section to your config:
+
+```json
+{
+  "budget": {
+    "maxRequests": 8,
+    "allowanceUsd": 0.10,
+    "reserveUsdPerRequest": 0.01
+  }
+}
+```
+
+- `maxRequests`: Hard cap on dispatched requests. `null` or omitted means unlimited. `0` stops all calls.
+- `allowanceUsd`: Spending allowance in USD. `null` or omitted means unlimited. `0` stops all calls.
+- `reserveUsdPerRequest`: Conservative reservation per request when cost is unknown. This is an estimate, not a billing guarantee.
+
+`limits.maxAssessments` is optional and defaults to unlimited. When migrating from old configs, remove old cap settings or set `maxAssessments: null` to avoid persisting unintended limits.
 
 ## Tracing
 
@@ -86,7 +135,7 @@ Traces may contain project content. While tracing redacts credentials, perfect s
 
 ## Commands
 
-- `/jev-status`: Shows current supervision status, budget usage, and trace directory.
+- `/jev-status`: Shows current supervision status, budget usage, and trace directory. If inactive, it explains why (e.g., missing API key or invalid explicit configuration).
 - `/jev-trace`: Shows the path to the current run's trace directory.
 
 ## Status Definitions
@@ -129,8 +178,7 @@ npm run check
 To load the extension locally for testing:
 
 ```bash
-export JEV_LOOP_CONTROL_CONFIG="/absolute/path/to/jev-loop-control.config.json"
-pi --no-extensions -e ./src/index.ts
+pi -e /absolute/path/to/jev-loop-control/src/index.ts
 ```
 
 Tests use synthetic data and do not require paid credentials.
