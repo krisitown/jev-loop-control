@@ -143,7 +143,12 @@ test("snapshot: blocked results carry no executed flag but keep provenance and a
 	const snap = build(messages, target, []); // no hook receipts
 	const obs = snap.representation.recent_actions as Array<Record<string, unknown>>;
 	assert.equal(obs[0]!.executed, false);
-	assert.ok(obs[0]!.arguments, "recent actions keep the observed arguments for repeat detection");
+	assert.ok(!obs[0]!.arguments, "recent actions do not carry raw arguments");
+	assert.ok(obs[0]!.arguments_ref, "recent actions reference the observation");
+	const ref = obs[0]!.arguments_ref as string;
+	const observation = snap.observations.find(o => o.id === ref);
+	assert.ok(observation, "the referenced observation exists");
+	assert.ok(observation!.arguments, "the observation carries the arguments");
 	const snapExecuted = build(messages, target, ["c1"]);
 	assert.equal((snapExecuted.representation.recent_actions as Array<Record<string, unknown>>)[0]!.executed, true);
 });
@@ -180,16 +185,17 @@ test("snapshot: omitted evidence ids are honest; redaction and truncation are di
 	assert.ok(JSON.stringify(redacted.representation).includes("[REDACTED]"));
 
 	// Bounded HISTORY is context selection recorded on the history itself, with the
-	// elision mark. It is not a limitation of the current proposal, so the snapshot
+	// omission metadata. It is not a limitation of the current proposal, so the snapshot
 	// flag stays false (see steering-context.test.ts).
 	const longHistory = assistant("z".repeat(20000), [], "stop");
 	const truncatedSnap = build([longHistory, target], target, []);
-	const historyMeta = truncatedSnap.representation.history as { text: string; truncated: boolean; chars: number };
+	const historyMeta = truncatedSnap.representation.history as { text: string; truncated: boolean; chars: number; elided_chars: number; turns_omitted: number };
 	assert.equal(historyMeta.truncated, true, "history bounds are reported on representation.history");
 	assert.equal(historyMeta.chars, 20000, "exact original character count, not the labeled rendering");
 	assert.equal(truncatedSnap.truncated, false, "bounded history never claims a truncated proposal");
-	assert.ok(truncatedSnap.actorText.includes("[ELIDED]") || truncatedSnap.actorText.includes("characters elided"));
-	assert.ok(truncatedSnap.actorText.endsWith("z".repeat(100)), "the MOST RECENT text is kept, not a prefix");
+	assert.equal(truncatedSnap.actorText, "", "the entire assistant turn is omitted");
+	assert.equal(historyMeta.turns_omitted, 1, "one turn omitted");
+	assert.ok(historyMeta.elided_chars > 0, "elided chars metadata is present");
 });
 
 test("snapshot: identity hash covers the exact sanitized representation", () => {
@@ -215,13 +221,18 @@ test("snapshot: historical arguments are bounded to a 600-char summary, current 
 
 	// The historical call: bounded summary, original hash retained.
 	const action = (snap.representation.recent_actions as Array<Record<string, any>>)[0]!;
-	assert.equal(action.arguments_truncated, true);
-	assert.ok(action.arguments._summary.length <= 600, `summary is bounded, got ${action.arguments._summary.length}`);
-	assert.ok(!JSON.stringify(action).includes(secretPayload), "the full historical payload is not sent twice");
-	assert.equal(action.arguments_chars, action.arguments._original_chars);
+	assert.ok(!action.arguments, "action does not carry raw arguments");
+	assert.ok(action.arguments_ref, "action references the observation");
+	const ref = action.arguments_ref as string;
+	const observation = snap.observations.find(o => o.id === ref);
+	assert.ok(observation, "the referenced observation exists");
+	assert.ok(observation!.arguments, "the observation carries the arguments");
+	assert.ok((observation!.arguments as { _summary: string })._summary.length <= 600, `summary is bounded, got ${(observation!.arguments as { _summary: string })._summary.length}`);
+	assert.ok(!JSON.stringify(observation!.arguments).includes(secretPayload), "the full historical payload is not sent twice");
+	assert.equal((observation!.arguments as { _original_chars: number })._original_chars, JSON.stringify({path:"a.ts",content:secretPayload}).length);
 	// The hash is of the ORIGINAL arguments, so a repeat is still detected exactly.
 	assert.equal(action.arguments_hash, hashJson({ path: "a.ts", content: secretPayload }));
-	assert.notEqual(action.arguments_hash, hashJson({ _summary: action.arguments._summary }));
+	assert.notEqual(action.arguments_hash, hashJson({ _summary: (observation!.arguments as { _summary: string })._summary }));
 	assert.equal((snap.representation.context_selection as { arguments_truncated_count: number }).arguments_truncated_count, 1);
 });
 
@@ -290,7 +301,6 @@ test("snapshot: bounded history keeps the MOST RECENT turns and states exact ori
 	assert.ok(snap.actorText.length <= config.limits.maxEvidenceChars, "the bound is honored by the bytes");
 	assert.ok(snap.actorText.includes("turn 6"), "newest text survives");
 	assert.ok(!snap.actorText.includes("turn 1 "), "oldest text is what gets dropped");
-	assert.ok(snap.actorText.includes("characters elided"));
 	assert.ok(history.elided_chars > 0 && history.turns_omitted > 0);
 });
 

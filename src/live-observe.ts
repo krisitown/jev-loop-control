@@ -10,7 +10,7 @@ import { TraceStore, defaultRunsDir, runId } from "./trace.ts";
 import { makeScrub, redactValue } from "./redact.ts";
 import type { Assessment, AssessmentKind, BudgetState, Decision, EvidenceSnapshot, Question, JevClient } from "./types.ts";
 import { applyCompletionContinuation, applyDirectionBlock } from "./interventions.ts";
-import { assessmentBudgetReason, retryRequestBudget } from "./budget.ts";
+import { assessmentBudgetReason, retryRequestBudget, retryRequestBudgetReason } from "./budget.ts";
 import type { ToolCallEventResult, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import { createRecovery, advanceRecovery, recoveryInstruction, beginRecovery, recoveryEvidenceKey, type RecoveryState, type RecoveryMode } from "./recovery.ts";
 
@@ -117,7 +117,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 		const trace = new TraceStore({ dir: traceDir, artifacts: config.trace.artifacts, runId: runIdStr, scrub: makeScrub([apiKey]) });
 
 		// The live client is built before the session state exists, so the retry
-		// budget reads this shared object: the adapter mutates it in place, and the
+		// gate reads this shared object: the adapter mutates it in place, and the
 		// transport sees the counts as they are at the moment a 503 arrives.
 		const budgetProbe: BudgetState = { requestsUsed: 0, reservedUsd: 0, billedUsd: 0, marketUsd: 0, unknownCosts: 0 };
 
@@ -135,9 +135,21 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			// the client gets its own env copy; production keeps reading process.env.
 			...(dependencies?.fetchImpl ? { env: { ...process.env, [config.jev.apiKeyEnv]: apiKey } } : {}),
 			// The one HTTP 503 retry spends from the same caps as any request, and
-			// this is read at retry time, so `budget.maxRequests` really does decide
-			// whether the second request goes out.
-			retryBudget: () => retryRequestBudget(config, budgetProbe),
+			// this is asked at retry time against the attempts already DISPATCHED
+			// (the adapter's own counter only learns the total at settlement), so
+			// `budget.maxRequests` really does decide whether the next request goes
+			// out, and an already-dispatched attempt is never counted twice.
+			retryBudget: ({ attempts }) => {
+				const extra = Math.max(0, attempts - 1);
+				const probe: BudgetState = {
+					requestsUsed: budgetProbe.requestsUsed + extra,
+					reservedUsd: budgetProbe.reservedUsd + extra * config.budget.reserveUsdPerRequest,
+					billedUsd: budgetProbe.billedUsd,
+					marketUsd: budgetProbe.marketUsd,
+					unknownCosts: budgetProbe.unknownCosts,
+				};
+				return retryRequestBudget(config, probe);
+			},
 		});
 
 		state = {
@@ -359,14 +371,19 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			signal: ctx.signal,
 			deadlineMs: s.config.jev.deadlineMs,
 		}).then((a) => {
-			if (a.cost.billedUsd !== null) {
-				s.budget.billedUsd += a.cost.billedUsd;
+			if (a.usage.attempts === 0) {
 				s.budget.reservedUsd -= reserve;
+				s.budget.requestsUsed--;
 			} else {
-				s.budget.unknownCosts++;
+				if (a.cost.billedUsd !== null) {
+					s.budget.billedUsd += a.cost.billedUsd;
+					s.budget.reservedUsd -= reserve;
+				} else {
+					s.budget.unknownCosts++;
+				}
+				if (a.cost.marketUsd !== null) s.budget.marketUsd += a.cost.marketUsd;
+				accountRetryRequests(s, a, "direction");
 			}
-			if (a.cost.marketUsd !== null) s.budget.marketUsd += a.cost.marketUsd;
-			accountRetryRequests(s, a, "direction");
 
 			const requestPath = a.requestBody !== undefined ? s.trace.artifact("request", a.requestBody, a.requestId) : null;
 			const responsePath = a.responseBody !== undefined ? s.trace.artifact("response", a.responseBody, a.requestId) : null;
@@ -484,14 +501,19 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 						signal: ctx.signal,
 						deadlineMs: s.config.jev.deadlineMs,
 					});
-					if (a.cost.billedUsd !== null) {
-						s.budget.billedUsd += a.cost.billedUsd;
+					if (a.usage.attempts === 0) {
 						s.budget.reservedUsd -= reserve;
+						s.budget.requestsUsed--;
 					} else {
-						s.budget.unknownCosts++;
+						if (a.cost.billedUsd !== null) {
+							s.budget.billedUsd += a.cost.billedUsd;
+							s.budget.reservedUsd -= reserve;
+						} else {
+							s.budget.unknownCosts++;
+						}
+						if (a.cost.marketUsd !== null) s.budget.marketUsd += a.cost.marketUsd;
+						accountRetryRequests(s, a, "completion");
 					}
-					if (a.cost.marketUsd !== null) s.budget.marketUsd += a.cost.marketUsd;
-					accountRetryRequests(s, a, "completion");
 
 					const requestPath = a.requestBody !== undefined ? s.trace.artifact("request", a.requestBody, a.requestId) : null;
 					const responsePath = a.responseBody !== undefined ? s.trace.artifact("response", a.responseBody, a.requestId) : null;

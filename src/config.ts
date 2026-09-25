@@ -71,7 +71,9 @@ export interface PolicySection {
  * policy, traces, and tests read the same constants.
  */
 export const POLICY_INVARIANTS = Object.freeze({
-	requireActionableFocus: true,
+	// Requirement attribution is optional: a strongly supported redirect may steer
+	// on usefulness alone when no specific requirement defect is identified.
+	requireActionableFocus: false,
 	workModesGuidanceOnly: true,
 });
 
@@ -135,7 +137,7 @@ export function defaultConfig(): SupervisorConfig {
 			endpoint: DEFAULT_ENDPOINTS.vercelTypesafe,
 			model: "typesafe-ai/jev",
 			apiKeyEnv: "AI_GATEWAY_API_KEY",
-			deadlineMs: 5000,
+			deadlineMs: 10000,
 			maxResponseBytes: 262_144,
 			// Local guard only. Sized to carry a bounded evidence snapshot plus the
 			// proposal under review; not an asserted provider limit.

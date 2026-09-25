@@ -4,7 +4,7 @@ Pi extension that supervises actor direction and completion with bounded Jev ass
 
 Jev checks the actor's proposed tools and completion status, applying bounded interventions when necessary. It works alongside the actor model you already use in Pi: **your configured Pi model stays the actor.** This version does not change that.
 
-**Version:** 0.3.3 · See [CHANGELOG.md](CHANGELOG.md).
+**Version:** 0.3.4 · See [CHANGELOG.md](CHANGELOG.md).
 
 Jev supervises and, in `enforce`, redirects work that its evidence does not support. Whether that improves your outcomes is yours to measure: this project makes no proven-effectiveness claim, and traces plus statuses are written so you can check each decision yourself.
 
@@ -34,7 +34,7 @@ pi update git:github.com/krisitown/jev-loop-control
 
 To pin to this release:
 ```bash
-pi install git:github.com/krisitown/jev-loop-control@v0.3.3
+pi install git:github.com/krisitown/jev-loop-control@v0.3.4
 ```
 
 *Note: This package is not available on npm. Do not use `npm install jev-loop-control`.*
@@ -88,7 +88,7 @@ The extension automatically discovers `jev-loop-control.config.json` in the curr
 | `limits.proposalLease` | `2` | Proposals a recovery objective stays attached to. |
 | `jev.maxRequestBytes` | `131072` | Local transport guard, not a provider limit. |
 | `jev.maxResponseBytes` | `262144` | Response size guard. |
-| `jev.deadlineMs` | `5000` | Wall-clock deadline per assessment. Retries HTTP 503 once after 500ms within the deadline. |
+| `jev.deadlineMs` | `10000` | Wall-clock deadline per assessment. Up to 3 HTTP 503 retries use 500ms, 1000ms, and 2000ms backoff within that total; explicit overrides remain in force. |
 
 ### Existing Configs
 
@@ -129,11 +129,11 @@ Your configured Pi model remains the actor. A bounded snapshot of the task traje
 
 ### Request Size Guard
 
-`jev.maxRequestBytes` (default `131072`) is a **local** ceiling on what this client will put on the wire. It is not an assertion about any provider's own limit, and raising it buys no extra provider allowance. A request above the guard is reported as a transport failure and the proposal passes through unassessed; there is no retry. Lower it if you want smaller outbound requests, raise it only if you have confirmed your endpoint accepts them.
+`jev.maxRequestBytes` (default `131072`) is a **local** ceiling on what this client will put on the wire. It is not an assertion about any provider's own limit, and raising it buys no extra provider allowance. The guard additionally estimates `ceil(UTF8bytes/2)`: `state + longestQuestion <= 16000` tokens, `total <= 32000` tokens. These are estimates, not an exact tokenizer. A mandatory oversize packet is retained but skipped as `UNCHECKED`. Lower it if you want smaller outbound requests, raise it only if you have confirmed your endpoint accepts them.
 
 ### HTTP 503 Retry
 
-Exactly one failure mode is ever retried: an HTTP **503** whose response drained without the deadline or a cancellation firing. After a fixed **500 ms** wait, one second request goes out — inside the same total `jev.deadlineMs`, never a second one after that, and never for any other status, an invalid body, a transport error, a deadline, or a cancellation. If the retry succeeds, the assessment succeeds with `attempts: 2` and a trace note (`http 503 retried once after 500ms: succeeded`); the first failure is not hidden. The retry spends from the same `budget.maxRequests` and `budget.allowanceUsd` as any other request (checked at retry time), but it is **one assessment, not two**. The failed 503's cost stays unknown and its reservation stays armed even when the retry reports a known cost, so `unknownCosts` and `reservedUsd` in `/jev-status` and `summary.json` stay honest.
+Exactly one failure mode is ever retried: an HTTP **503** whose response drained without the deadline or a cancellation firing. Up to **3 retries** (max 4 attempts) use **500ms**, **1000ms**, and **2000ms** backoff inside the same total `jev.deadlineMs`; no other status, invalid body, transport error, deadline, or cancellation is retried. Each retry uses the same `budget.maxRequests` and `budget.allowanceUsd` checks, while remaining one assessment. Failed 503 costs remain unknown and their reservations stay armed.
 
 ### Optional Budget Limits
 
@@ -161,10 +161,10 @@ Each assessment carries a **bounded view of the task trajectory**, not the whole
 
 - Task requirements and their origin (from the manifest, or the original request).
 - The single proposal under review: terminal text or proposed tool calls with their argument hashes.
-- Conversation history capped at `limits.maxEvidenceChars` (default 12000), excluding the candidate text itself.
+- Conversation history: `limits.maxEvidenceChars` (default 12000) is a soft budget for optional assistant turns. All user instructions survive; exact repeated long requirement text is replaced by a reference to the matching ID in `task.requirements`. Old assistant turns are dropped first, then optional old observations, to target 28000 canonical UTF-8 bytes. Full requirements and the full current proposal are retained. The newest 3 selected observations, latest 2 executed errors, and verification check evidence are protected.
 - Bounded verification context: Python unittest summaries from executed bash output are reported separately from tool completion; a pipeline exit 0 no longer appears as test success. Latest four recognized checks are retained by exact command; older failures remain history, with no claim that a different suite supersedes them. Unsupported formats remain raw evidence, not guessed passing results.
-- Recent tool results: the **last 12** observations, plus up to **2 total older problematic observations** (tool errors OR failed verifications) that fall outside that window, so an old failure is not silently forgotten.
-- Recent actions: the last 24 actions with success/error status, whether they actually executed, and arguments capped at 600 characters plus a hash.
+- Recent tool results: the **last 12** observations, plus up to **2 total older problematic observations** (tool errors OR failed verifications) that fall outside that window, so an old failure is not silently forgotten. Optional old observations may be pruned to meet the size target; retention of all is not guaranteed.
+- Recent actions: the last 24 actions with success/error status, whether they actually executed, and `arguments_hash` plus `arguments_ref` pointing to retained observation args (still bounded to 600 chars), or `arguments_omitted`; no duplicate args.
 - Deterministic facts: the last 24, with an omitted count.
 - The last 5 prior interventions, `omitted_evidence_ids`, and `context_selection` truncation metadata.
 
@@ -172,7 +172,7 @@ Each assessment carries a **bounded view of the task trajectory**, not the whole
 
 ## Interventions and Recovery Guidance
 
-In `enforce`, a direction block opens a recovery: a mode (`RESEARCH`, `REPLAN`, `VERIFY`, `EXECUTE`) and an objective taken from the assessment memo. Questions now distinguish a concrete local correction (`EXECUTE`) from approach redesign (`REPLAN`), compare proposed behavior with user requirements, and allow legitimate corrections of actor-authored tests. The objective is delivered as a hidden guidance message and stays attached for `limits.proposalLease` proposals (default **2**), then expires. **Expiry does not mean the objective was met.**
+In `enforce`, a direction block opens a recovery: a mode (`RESEARCH`, `REPLAN`, `VERIFY`, `EXECUTE`) and an objective taken from the assessment memo. Questions now distinguish a concrete local correction (`EXECUTE`) from approach redesign (`REPLAN`), compare proposed behavior with user requirements, and allow legitimate corrections of actor-authored tests. Strongly supported usefulness direction can steer without requirement mismatch; ordinary productive work, investigation, or retest after change should pass. The objective is delivered as a hidden guidance message and stays attached for `limits.proposalLease` proposals (default **2**), then expires. **Expiry does not mean the objective was met.**
 
 - **Duplicate suppression:** a recovery for the same focus and the same recent evidence is not reopened. The repeat is traced as `intervention.suppressed` instead of re-issuing the same advice.
 - **Repeats at completion:** the same unfinished focus with no new evidence stops instead of looping.
@@ -206,7 +206,7 @@ Status values:
 - **UNCHECKED**: Assessment unavailable or skipped; not a success verdict.
 - **COMPLETE**: All requirements strongly supported and final claims supported.
 
-Failed or weak assessments do not cause intervention. HTTP requests retry 503 once after 500ms within the deadline; other failures are not retried. Request/assessment limits apply per session; intervention limits per task. Thresholds, no-budget defaults, and one 503 retry unchanged.
+Failed or weak assessments do not cause intervention. HTTP requests retry 503 up to 3 times with exponential backoff within the deadline; other failures are not retried. Request/assessment limits apply per session; intervention limits per task.
 
 ## Task Manifest
 

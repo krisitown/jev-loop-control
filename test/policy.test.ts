@@ -312,7 +312,7 @@ test("assessment failure never becomes claimed success", () => {
 
 // ---------------------------------------------------------------- direction
 
-test("direction: strong redirect with actionable focus blocks; weak signals pass through", () => {
+test("direction: strong redirect with actionable focus blocks; weak focus now blocks generically", () => {
 	const cfg = config();
 	const snap = snapshot(REQ);
 	const base = { kind: "direction" as const, snapshot: snap, config: cfg, counters };
@@ -336,9 +336,9 @@ test("direction: strong redirect with actionable focus blocks; weak signals pass
 			focus_requirement: ns({ R1: 0.4, R2: 0.1, NONE: 0.4, UNKNOWN: 0.1 }, "NONE"),
 		}),
 	});
-	assert.equal(weakFocus.apply, "none", "a mode alone is not grounds to block; focus must be actionable");
-	assert.equal(weakFocus.status, "UNRESOLVED", "no actionable focus is unresolved, never an executed verdict");
-	assert.ok(weakFocus.reasons.some((r) => r.includes("no_actionable_focus")), weakFocus.reasons.join(";"));
+	assert.equal(weakFocus.apply, "block", "a strongly supported route blocks even without actionable focus");
+	assert.equal(weakFocus.status, "RESEARCH");
+	assert.ok(weakFocus.reasons.some((r) => r.includes("generic_usefulness")), weakFocus.reasons.join(";"));
 });
 
 test("direction: a weak corrective next_step is UNRESOLVED, not EXECUTE (weak_support)", () => {
@@ -486,9 +486,10 @@ test("repeated failure: never fires on the repetition diagnostic alone (no measu
 		config: config(),
 		counters,
 	});
-	assert.equal(decision.apply, "none");
-	assert.equal(decision.status, "UNRESOLVED");
-	assert.ok(decision.reasons.some((r) => r.includes("no_actionable_focus")), decision.reasons.join(";"));
+	assert.equal(decision.apply, "block", "strong route blocks generically even without measured failures");
+	assert.equal(decision.status, "RESEARCH");
+	assert.ok(decision.reasons.some((r) => r.includes("generic_usefulness")), decision.reasons.join(";"));
+	assert.ok(!decision.reasons.some((r) => r.includes("repeated_failure_focus")), "no repeated_failure_focus when no measured failures");
 });
 
 test("repeated failure: a proposal that changes the arguments is not a repeat", () => {
@@ -504,8 +505,10 @@ test("repeated failure: a proposal that changes the arguments is not a repeat", 
 		config: config(),
 		counters,
 	});
-	assert.equal(decision.apply, "none", "changed arguments are a changed approach, not a repeated failure");
-	assert.equal(decision.status, "UNRESOLVED");
+	assert.equal(decision.apply, "block", "strong route blocks generically even if args changed");
+	assert.equal(decision.status, "RESEARCH");
+	assert.ok(decision.reasons.some((r) => r.includes("generic_usefulness")), decision.reasons.join(";"));
+	assert.ok(!decision.reasons.some((r) => r.includes("repeated_failure_focus")), "no repeated_failure_focus when args changed");
 });
 
 test("repeated failure: identical SUCCESSFUL calls never trigger the fallback", () => {
@@ -519,9 +522,10 @@ test("repeated failure: identical SUCCESSFUL calls never trigger the fallback", 
 		config: config(),
 		counters,
 	});
-	assert.equal(decision.apply, "none", "repeating a call that succeeded is not a repeated failure");
-	assert.equal(decision.status, "UNRESOLVED");
-	assert.ok(decision.reasons.some((r) => r.includes("no_actionable_focus")), decision.reasons.join(";"));
+	assert.equal(decision.apply, "block", "strong route blocks generically even with successful calls");
+	assert.equal(decision.status, "RESEARCH");
+	assert.ok(decision.reasons.some((r) => r.includes("generic_usefulness")), decision.reasons.join(";"));
+	assert.ok(!decision.reasons.some((r) => r.includes("repeated_failure_focus")), "no repeated_failure_focus when calls succeeded");
 });
 
 test("repeated failure: two real executed failures trigger it even among successes", () => {
@@ -548,8 +552,10 @@ test("repeated failure: below the diagnostic threshold the measured repeat still
 		config: config(),
 		counters,
 	});
-	assert.equal(decision.apply, "none");
-	assert.ok(decision.reasons.some((r) => r.includes("no_actionable_focus")), decision.reasons.join(";"));
+	assert.equal(decision.apply, "block", "strong route blocks generically even below repeat threshold");
+	assert.equal(decision.status, "RESEARCH");
+	assert.ok(decision.reasons.some((r) => r.includes("generic_usefulness")), decision.reasons.join(";"));
+	assert.ok(!decision.reasons.some((r) => r.includes("repeated_failure_focus")), "no repeated_failure_focus when below threshold");
 });
 
 test("repeated failure: a strong PROCEED is never overridden by repetition", () => {
@@ -635,6 +641,25 @@ test("REVIEW 29.2: the fallback reports a missing focus only when the focus real
 	});
 	assert.equal(ghost.apply, "block", "a strong focus on an unknown requirement is not actionable, so the fallback applies");
 	assert.ok(ghost.reasons.some((r) => r.startsWith("repeated_failure_focus")), ghost.reasons.join(";"));
+});
+
+test("direction: strong REPLAN with NONE focus and low repeat blocks generically", () => {
+	const decision = decideDirection({
+		kind: "direction",
+		assessment: assessment({
+			next_step: ns({ REPLAN: 0.9, PROCEED: 0.05, RESEARCH: 0.02, VERIFY: 0.02, UNCERTAIN: 0.01 }, "REPLAN"),
+			unproductive_repeat: { type: "noul", questionId: "unproductive_repeat", noul: 0.1 },
+			focus_requirement: NO_FOCUS,
+		}),
+		snapshot: snapshot(REQ),
+		config: config(),
+		counters,
+	});
+	assert.equal(decision.apply, "block", "strong REPLAN blocks generically even with NONE focus and low repeat");
+	assert.equal(decision.status, "REPLAN");
+	assert.ok(decision.reasons.some((r) => r.includes("generic_usefulness")), decision.reasons.join(";"));
+	assert.ok(!decision.reasons.some((r) => r.includes("repeated_failure_focus")), "no repeated_failure_focus when no measured failures");
+	assert.ok(!decision.memo!.includes("requirement defect"), "memo does not claim requirement defect");
 });
 
 test("fixture integrity: the repeat fixtures record what their names claim", () => {

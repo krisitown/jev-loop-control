@@ -34,6 +34,7 @@ import type {
 	SnapshotToolCall,
 } from "./types.ts";
 import type { SupervisorConfig } from "./config.ts";
+import { pruneContext } from "./context.ts";
 
 /** Minimal structural view of a Pi message; avoids importing Pi types here. */
 export interface Msg {
@@ -560,7 +561,7 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 
 	// One canonical representation: hashed for identity and rendered into the
 	// request. The hash and the request bytes can therefore never diverge.
-	const representation: Record<string, unknown> = {
+	let representation: Record<string, unknown> = {
 		requirements: input.requirements.map((requirement) => ({
 			id: requirement.id,
 			summary: scrub(requirement.summary),
@@ -583,11 +584,11 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 		observations: retained,
 		recent_actions: (() => {
 			const recent = observationsAll.slice(-RECENT_ACTIONS_WINDOW);
+			const retainedIds = new Set(retained.map((o) => o.id));
 			return recent.map((observation) => {
 				// Observation arguments are already bounded at creation; the ORIGINAL
 				// argument hash is kept so a repeat is still detected exactly. The current
 				// proposal's own arguments are never bounded (see `proposal.tool_calls`).
-				const bounded = boundedArgsById.get(observation.id);
 				return {
 					tool: observation.toolName,
 					tool_call_id: observation.toolCallId,
@@ -605,14 +606,10 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 						: {}),
 					executed: observation.provenance === "executed",
 					evidence_id: observation.id,
-					...(observation.arguments !== undefined
-						? {
-							arguments: observation.arguments,
-							arguments_hash: observation.argsHash,
-							arguments_truncated: bounded?.truncated === true,
-							...(bounded?.truncated ? { arguments_chars: bounded.chars } : {}),
-						}
-						: {}),
+					arguments_hash: observation.argsHash,
+					...(retainedIds.has(observation.id)
+						? { arguments_ref: observation.id }
+						: { arguments_omitted: true }),
 				};
 			});
 		})(),
@@ -633,6 +630,7 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 		},
 	};
 
+	representation = pruneContext(representation, historyTurns, historyBudget);
 	const snapshotHash = hashJson(representation);
 	const serialized = JSON.stringify(representation);
 	return {
@@ -646,10 +644,10 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 			requirements: input.requirements.map((requirement) => ({ ...requirement, summary: scrub(requirement.summary), origin: scrub(requirement.origin) })),
 			origin: scrub(input.requirements[0]?.origin ?? "unknown"),
 		},
-		actorText: history.text,
+		actorText: (representation.history as { text: string }).text,
 		proposalText,
 		toolCalls,
-		observations: retained,
+		observations: representation.observations as SnapshotObservation[],
 		priorInterventions,
 		facts,
 		scope: { ...input.scope, snapshotHash },
