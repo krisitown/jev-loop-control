@@ -259,7 +259,7 @@ Tests use synthetic data and do not require paid credentials.
 - Recovery guidance state is in memory only; it is not rebuilt after a restart.
 - Gateway cost fields may remain unknown; reservations are kept in these cases.
 - This is a supervisor, not a security boundary.
-- Completion continuation exercised with real Pi; tool-batch blocking covered by synthetic checks.
+- Completion continuation exercised with real Pi; tool blocking exercised in controlled Pi workflow; general effectiveness remains unproven.
 - This product does not detect every bug or handle arbitrary test frameworks.
 
 ## License

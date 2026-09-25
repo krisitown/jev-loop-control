@@ -5,7 +5,7 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
-## 0.3.3 - Candidate
+## 0.3.3 - 2026-09-25
 
 Patch on top of 0.3.2.
 
@@ -17,7 +17,7 @@ Patch on top of 0.3.2.
 
 ### Testing
 
-Relevant tests updated to reflect verification context changes and retention logic. Independent validation is pending and will be completed before release.
+TypeScript and 197 tests passed, including masked unittest failures, latest-same-command checks and total retention bound. Live gateway corrective judgments and tool blocking exercised in a controlled Pi workflow, without claiming general output improvement.
 
 ## 0.3.2 - 2026-09-25
 
