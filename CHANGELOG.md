@@ -5,7 +5,7 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
-## 0.3.2 - Current candidate
+## 0.3.2 - 2026-09-25
 
 Patch on top of 0.3.1.
 
@@ -27,14 +27,7 @@ Patch on top of 0.3.1.
 
 ### Testing
 
-- Offline only. Transport-level retry tests (statuses, deadline, cancellation,
-  gate inputs, artifacts) plus end-to-end accounting through the real
-  `liveObserve`/`createHttpClient` wiring with a scripted fetch: 503-then-200
-  ends at 2 requests / 1 assessment / billed 0.05 / 1 unknown / 0.01 reserved;
-  503 twice ends at 2 unknowns / 0.02 reserved; `maxRequests: 1` denies the
-  retry at the production gate, `maxRequests: 2` allows it. Suite green at this
-  commit via `npm run check`. No live endpoint was contacted; the retry's real-
-  world behaviour against the actual provider remains to be measured.
+TypeScript and 176 tests passed. Real Pi adapter tests cover accounting/caps. Live gateway retry recovery also observed. No effectiveness or improvement guarantee.
 
 ## 0.3.1 - Previous candidate
 

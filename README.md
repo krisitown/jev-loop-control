@@ -4,7 +4,7 @@ Pi extension that supervises actor direction and completion with bounded Jev ass
 
 Jev checks the actor's proposed tools and completion status, applying bounded interventions when necessary. It works alongside the actor model you already use in Pi: **your configured Pi model stays the actor.** This version does not change that.
 
-**Version:** 0.3.2 (candidate) · See [CHANGELOG.md](CHANGELOG.md).
+**Version:** 0.3.2 · See [CHANGELOG.md](CHANGELOG.md).
 
 Jev supervises and, in `enforce`, redirects work that its evidence does not support. Whether that improves your outcomes is yours to measure: this project makes no proven-effectiveness claim, and traces plus statuses are written so you can check each decision yourself.
 
@@ -25,6 +25,16 @@ Install this extension via Git in a normal terminal:
 
 ```bash
 pi install git:github.com/krisitown/jev-loop-control
+```
+
+To update an existing installation:
+```bash
+pi update git:github.com/krisitown/jev-loop-control
+```
+
+To pin to this release:
+```bash
+pi install git:github.com/krisitown/jev-loop-control@v0.3.2
 ```
 
 *Note: This package is not available on npm. Do not use `npm install jev-loop-control`.*
