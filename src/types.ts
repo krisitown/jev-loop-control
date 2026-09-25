@@ -237,6 +237,8 @@ export interface EvidenceSnapshot {
 	proposalText: string;
 	toolCalls: SnapshotToolCall[];
 	observations: SnapshotObservation[];
+	/** Complete sanitized local source text for packet selection; never serialized wholesale. */
+	sourceObservations?: Array<{ id: string; text: string; source: string }>;
 	priorInterventions: Array<{ kind: string; at: string; focus: string }>;
 	facts: DeterministicFact[];
 	scope: { sessionId: string; taskId: string; branch: string; snapshotHash: string };

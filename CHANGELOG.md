@@ -5,6 +5,15 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
+## 0.4.0-dev.3 - 2026-09-26
+
+- Preserves complete sanitized tool-result sources locally before legacy wire
+  compaction, allowing S1/S2 to select intact diagnostic units and omit them as
+  whole units when the packet budget requires it.
+- These local originals are not serialized wholesale and do not change snapshot
+  identity; the tuned packet records the selected source IDs and its own hash.
+- Development checkpoint only; campaign readiness gates remain open.
+
 ## 0.4.0-dev.2 - 2026-09-26
 
 - Extends the opt-in path to completion assessments with explicit SUPPORTED,

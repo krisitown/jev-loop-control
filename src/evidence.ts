@@ -437,6 +437,7 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 	// up later by its (redacted) tool-call id would compare a sanitized id against
 	// unsanitized messages and silently report zeros for any id carrying a secret.
 	const truncationById = new Map<string, ObservationTruncation>();
+	const sourceObservations: Array<{ id: string; text: string; source: string }> = [];
 	// Same rule for arguments: the observation carries a bounded SUMMARY, and the
 	// hash stays that of the COMPLETE arguments. Capping only `recent_actions` was
 	// not enough, because `observations` shipped the full old write content too.
@@ -470,6 +471,7 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 		}
 		// Result text is bounded, and the bound is visible in `representation`.
 		const capped = capTo(scrub(visibleText(message)), OBSERVATION_TEXT_CHARS);
+		sourceObservations.push({ id, text: scrub(visibleText(message)), source: `pi:${scrub(rawToolName || "unknown")}:tool_result(${didExecute ? "executed" : "reported"})` });
 		truncationById.set(id, {
 			id,
 			tool_call_id: toolCallId,
@@ -648,6 +650,7 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 		proposalText,
 		toolCalls,
 		observations: representation.observations as SnapshotObservation[],
+		sourceObservations,
 		priorInterventions,
 		facts,
 		scope: { ...input.scope, snapshotHash },

@@ -295,7 +295,10 @@ export function ledgerFromSnapshot(snapshot: EvidenceSnapshot): EvidenceLedger {
 		userGoal: { id: "USER_GOAL", kind: "requirement", text: historyGoal || "Current user task (full goal unavailable in this snapshot)", source: snapshot.task.origin, protected: true },
 		requirements: snapshot.task.requirements.map((item) => ({ id: item.id, kind: "requirement", text: item.summary, source: item.origin })),
 		proposals: [{ id: proposalId, kind: "proposal", text: [snapshot.proposalText, ...snapshot.toolCalls.map((call) => `${call.name} ${JSON.stringify(call.arguments)}`)].filter(Boolean).join("\n\n"), source: snapshot.target.messageRef, protected: true }],
-		observations: snapshot.observations.map((item) => ({ id: item.id, kind: "observation", text: item.text, source: `${item.toolName}:${item.toolCallId}`, references: item.argsHash ? [item.argsHash] : undefined })),
+		observations: (snapshot.sourceObservations ?? snapshot.observations.map((item) => ({ id: item.id, text: item.text, source: `${item.toolName}:${item.toolCallId}` }))).map((source) => {
+			const retained = snapshot.observations.find((candidate) => candidate.id === source.id);
+			return { id: source.id, kind: "observation", text: source.text, source: source.source, references: retained?.argsHash ? [retained.argsHash] : undefined };
+		}),
 		trajectory: (rep.recent_actions ?? []).map((item, index) => ({ id: `trajectory:${index}`, kind: "trajectory", text: JSON.stringify(item), source: "snapshot.recent_actions" })),
 		concerns: snapshot.priorInterventions.map((item, index) => ({ id: `concern:${index}`, kind: "concern", text: item.focus, source: `prior_intervention:${item.at}`, status: "open" })),
 	};
