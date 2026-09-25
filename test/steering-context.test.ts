@@ -89,11 +89,15 @@ test("steering-context: huge historical write args bounded with hash, current pr
 	// Let's add a result for it to test historical bounding.
 	const messagesWithResult = [assistant("run", [{ id: "c1", name: "write", arguments: { content: hugeArg } }]), toolResult("c1", "ok")];
 	const snap2 = build(messagesWithResult, assistant("done", [], "stop"), ["c1"]);
-	const ra = (snap2.representation.recent_actions as Array<{ arguments?: unknown; arguments_hash?: string; arguments_truncated?: boolean }>)[0];
+	const ra = (snap2.representation.recent_actions as Array<{ arguments?: unknown; arguments_hash?: string; arguments_ref?: string }>)[0];
 	assert.ok(ra);
-	assert.ok(ra.arguments_truncated, "historical args > 600 chars should be truncated in recent_actions");
+	assert.ok(!ra.arguments, "action does not carry raw arguments");
+	assert.ok(ra.arguments_ref, "action references the observation");
 	assert.ok(ra.arguments_hash, "hash preserved");
-	assert.ok((ra.arguments as { _summary: string })._summary.length <= 600);
+	const ref = ra.arguments_ref as string;
+	const observation = snap2.observations.find(o => o.id === ref);
+	assert.ok(observation, "the referenced observation exists");
+	assert.ok((observation!.arguments as { _summary: string })._summary.length <= 600);
 });
 
 test("steering-context: 20k chars actor history truncated meta but snapshot.truncated false", () => {
@@ -164,14 +168,20 @@ test("steering-context: outgoing state carries context_selection and the active 
 	// The proposal's own arguments stay complete in the outgoing state.
 	const proposal = state.proposal as { tool_calls: Array<{ arguments: { command: string } }> };
 	assert.equal(proposal.tool_calls[0]!.arguments.command, "make test");
-	const historicalArgs = (evidence.recent_actions as Array<Record<string, any>>)[0]!.arguments;
+	const action = (evidence.recent_actions as Array<Record<string, any>>)[0]!;
+	assert.ok(!action.arguments, "action does not carry raw arguments");
+	assert.ok(action.arguments_ref, "action references the observation");
+	const ref = action.arguments_ref as string;
+	const observation = (evidence.observations as Array<{id:string; arguments:{_summary:string;_original_chars:number}}>).find(o => o.id === ref);
+	assert.ok(observation, "the referenced observation exists");
+	const historicalArgs = observation!.arguments;
 	const historical = JSON.stringify(historicalArgs);
 	assert.ok(historical.includes("[ELIDED]"), "the historical argument summary states what was bounded");
 	assert.ok(!JSON.stringify(evidence.recent_actions).includes("w".repeat(2000)), "the full historical payload is not sent");
 	assert.equal(typeof historicalArgs._summary, "string", "oversized historical arguments are replaced by a summary");
 	assert.ok(historicalArgs._summary.length <= 600, `summary is bounded, got ${historicalArgs._summary.length}`);
 	assert.ok(historical.length <= 700, `bounded summary stays bounded, got ${historical.length}`);
-	assert.equal((evidence.recent_actions as Array<Record<string, any>>)[0]!.arguments_hash.length, 16, "the original hash is kept for exact repeat detection");
+	assert.equal(action.arguments_hash.length, 16, "the original hash is kept for exact repeat detection");
 	assert.equal((state.evidence as { actor_history: { truncated: boolean } }).actor_history.truncated, false, "a short transcript is not reported as bounded");
 });
 

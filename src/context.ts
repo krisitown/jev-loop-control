@@ -33,7 +33,7 @@ export function pruneContext(
           const replacement = `[See task.requirements ${req.id}]`;
           const removed = req.summary.length - replacement.length;
           if (removed > 0) {
-            const count = (newText.match(new RegExp(req.summary.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+            const count = newText.split(req.summary).length - 1;
             if (count > 0) {
               newText = newText.split(req.summary).join(replacement);
               deduplicatedChars += removed * count;
@@ -69,8 +69,8 @@ export function pruneContext(
     clonedRep.history = {
       text: rendered,
       truncated,
-      chars: original.reduce((sum, t) => sum + t.text.length, 0),
-      rendered_chars: renderedChars,
+      chars: turns.reduce((sum, t) => sum + t.text.length, 0),
+      rendered_chars: renderHistory(turns).length,
       elided_chars: elidedChars,
       turns: original.length,
       turns_omitted: omittedTurns,
@@ -155,6 +155,11 @@ export function pruneContext(
         act.arguments_omitted = true;
       }
     }
+    if (Array.isArray(clonedRep.context_selection?.truncation_metadata)) {
+      clonedRep.context_selection.truncation_metadata = clonedRep.context_selection.truncation_metadata.filter(
+        (entry: any) => currentObsIds.has(entry.id)
+      );
+    }
   };
 
   // Helper: Refresh metadata with bounded iteration
@@ -179,7 +184,7 @@ export function pruneContext(
         budget_exceeded: budgetExceeded,
       };
 
-      if (bytes === clonedRep.context_selection.representation_bytes) break;
+      if (computeRepBytes() === bytes) break;
       iterations++;
     }
   };
@@ -221,8 +226,8 @@ export function pruneContext(
   }
 
   // Final metadata refresh
-  refreshMetadata();
   validateRecentActions();
+  refreshMetadata();
 
   return clonedRep;
 }

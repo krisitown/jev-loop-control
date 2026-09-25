@@ -468,38 +468,39 @@ export function createHttpClient(options: HttpClientOptions): JevClient {
 				const responseBody = scrub(outcome.responseText);
 				return { responseBody, responseHash: hashBytes(responseBody) };
 			};
-if (built.bytes > options.maxRequestBytes || (() => {
-	const parsed = JSON.parse(requestBody);
-	const bodyBytes = Buffer.byteLength(requestBody, 'utf8');
-	const stateBytes = Buffer.byteLength(JSON.stringify(parsed.state), 'utf8');
-	let maxQBytes = 0;
-	for (const [id, q] of Object.entries(parsed.questions)) {
-		const len = Buffer.byteLength(JSON.stringify({ [id]: q }), 'utf8');
-		if (len > maxQBytes) maxQBytes = len;
-	}
-	const estTotal = Math.ceil(bodyBytes / 2);
-	const estStateLongest = Math.ceil((stateBytes + maxQBytes) / 2);
-	return estTotal > 16000 || estStateLongest > 32000;
-})()) {
-	const msg = built.bytes > options.maxRequestBytes
-		? `request is ${built.bytes} bytes, above the configured limit of ${options.maxRequestBytes}`
-		: 'estimated context bounds exceeded';
-	return finish({
-		ok: false,
-		status: "UNCHECKED",
-		answers: {},
-		findings: [],
-		notes: "",
-		failure: { stage: "transport", message: msg },
-		cost: { billedUsd: null, marketUsd: null, unknown: true },
-		usage: { requestBytes: built.bytes, responseBytes: 0, attempts: 0 },
-		requestId,
-		requestHash,
-		requestBody,
-		responseHash: "",
-		origin: "live",
-	});
-}
+			if (built.bytes > options.maxRequestBytes || (() => {
+				const parsed = JSON.parse(requestBody);
+				const bodyBytes = Buffer.byteLength(requestBody, 'utf8');
+				const stateBytes = Buffer.byteLength(JSON.stringify(parsed.state), 'utf8');
+				let maxQBytes = 0;
+				for (const [id, q] of Object.entries(parsed.questions)) {
+					const len = Buffer.byteLength(JSON.stringify({ [id]: q }), 'utf8');
+					if (len > maxQBytes) maxQBytes = len;
+				}
+				const estTotal = Math.ceil(bodyBytes / 2);
+				const estStateLongest = Math.ceil((stateBytes + maxQBytes) / 2);
+				return estTotal > 32000 || estStateLongest > 16000;
+			})()) {
+				const isConfiguredByteCap = built.bytes > options.maxRequestBytes;
+				const msg = isConfiguredByteCap
+					? `request is ${built.bytes} bytes, above the configured limit of ${options.maxRequestBytes}`
+					: 'estimated context bounds exceeded: 16000 state+longest question, 32000 total, approximate UTF8/2 method';
+				return finish({
+					ok: false,
+					status: "UNCHECKED",
+					answers: {},
+					findings: [],
+					notes: "",
+					failure: { stage: isConfiguredByteCap ? "transport" : "budget", message: msg },
+					cost: { billedUsd: null, marketUsd: null, unknown: true },
+					usage: { requestBytes: built.bytes, responseBytes: 0, attempts: 0 },
+					requestId,
+					requestHash,
+					requestBody,
+					responseHash: "",
+					origin: "live",
+				});
+			}
 
 			// --- dispatch, with the 503 retry schedule --------------------------------
 			// Every failure except a clean HTTP 503 is final. A 503 is retried on the

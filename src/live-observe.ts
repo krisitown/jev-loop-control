@@ -371,14 +371,19 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			signal: ctx.signal,
 			deadlineMs: s.config.jev.deadlineMs,
 		}).then((a) => {
-			if (a.cost.billedUsd !== null) {
-				s.budget.billedUsd += a.cost.billedUsd;
+			if (a.usage.attempts === 0) {
 				s.budget.reservedUsd -= reserve;
+				s.budget.requestsUsed--;
 			} else {
-				s.budget.unknownCosts++;
+				if (a.cost.billedUsd !== null) {
+					s.budget.billedUsd += a.cost.billedUsd;
+					s.budget.reservedUsd -= reserve;
+				} else {
+					s.budget.unknownCosts++;
+				}
+				if (a.cost.marketUsd !== null) s.budget.marketUsd += a.cost.marketUsd;
+				accountRetryRequests(s, a, "direction");
 			}
-			if (a.cost.marketUsd !== null) s.budget.marketUsd += a.cost.marketUsd;
-			accountRetryRequests(s, a, "direction");
 
 			const requestPath = a.requestBody !== undefined ? s.trace.artifact("request", a.requestBody, a.requestId) : null;
 			const responsePath = a.responseBody !== undefined ? s.trace.artifact("response", a.responseBody, a.requestId) : null;
@@ -496,14 +501,19 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 						signal: ctx.signal,
 						deadlineMs: s.config.jev.deadlineMs,
 					});
-					if (a.cost.billedUsd !== null) {
-						s.budget.billedUsd += a.cost.billedUsd;
+					if (a.usage.attempts === 0) {
 						s.budget.reservedUsd -= reserve;
+						s.budget.requestsUsed--;
 					} else {
-						s.budget.unknownCosts++;
+						if (a.cost.billedUsd !== null) {
+							s.budget.billedUsd += a.cost.billedUsd;
+							s.budget.reservedUsd -= reserve;
+						} else {
+							s.budget.unknownCosts++;
+						}
+						if (a.cost.marketUsd !== null) s.budget.marketUsd += a.cost.marketUsd;
+						accountRetryRequests(s, a, "completion");
 					}
-					if (a.cost.marketUsd !== null) s.budget.marketUsd += a.cost.marketUsd;
-					accountRetryRequests(s, a, "completion");
 
 					const requestPath = a.requestBody !== undefined ? s.trace.artifact("request", a.requestBody, a.requestId) : null;
 					const responsePath = a.responseBody !== undefined ? s.trace.artifact("response", a.responseBody, a.requestId) : null;

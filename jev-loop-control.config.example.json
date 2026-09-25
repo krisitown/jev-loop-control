@@ -6,7 +6,7 @@
     "endpoint": "https://ai-gateway.vercel.sh/typesafe/v1/systemone",
     "model": "typesafe-ai/jev",
     "apiKeyEnv": "AI_GATEWAY_API_KEY",
-    "deadlineMs": 5000,
+    "deadlineMs": 10000,
     "maxRequestBytes": 131072
   },
   "limits": {

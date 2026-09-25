@@ -5,6 +5,15 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
+## 0.3.4 - 2026-09-25
+
+### Changed
+
+- HTTP 503 retries now use up to three retries (four total attempts) with 500ms, 1000ms, and 2000ms backoff within the total deadline.
+- The default `jev.deadlineMs` is 10000ms; explicit configured deadlines still apply.
+- Request context retains full user instructions and proposals, deduplicates exact repeated requirement text, and prunes optional older context first. Context estimates are conservative UTF-8 byte estimates (`ceil(bytes / 2)`), not exact tokenizer measurements; oversized mandatory packets are skipped unchecked.
+- Questions may focus on usefulness and strong supported direction without requiring a requirement mismatch.
+
 ## 0.3.3 - 2026-09-25
 
 Patch on top of 0.3.2.
