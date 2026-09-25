@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { createFixture, fauxAssistantMessage, fauxToolCall } from "./support/harness.ts";
-import { createHttpClient } from "../src/jev.ts";
 import { liveObserve } from "../src/live-observe.ts";
 import { readJsonLines } from "../src/trace.ts";
 import { retryRequestBudget, retryRequestBudgetReason, assessmentBudgetReason } from "../src/budget.ts";
@@ -68,7 +67,7 @@ interface RunResult {
 
 async function runRetryFixture(
 	t: { after(fn: () => void): void },
-	options: { script: number[]; billedUsd: number | null; budget?: Record<string, unknown>; requestsUsedDuring?: number },
+	options: { script: number[]; billedUsd: number | null; budget?: Record<string, unknown> },
 ): Promise<RunResult> {
 	const supervisorDir = mkdtempSync(join(tmpdir(), "jev-retry-config-"));
 	const traceDir = join(supervisorDir, "traces");
@@ -115,41 +114,11 @@ async function runRetryFixture(
 		return new Response(JSON.stringify(body), { status: 200 });
 	}) as unknown as typeof fetch;
 
-	// By default the client, the retry gate, the shared budget object, and every
-	// counter are production code inside liveObserve. With `requestsUsedDuring`,
-	// the client and the gate are still the production `createHttpClient` +
-	// `retryRequestBudget`, bound to a probe budget that reports the requests
-	// already DISPATCHED inside this assessment (the adapter's own counter only
-	// learns the total afterwards), so the cap is tested against the attempt
-	// count the retry loop actually holds.
-	const requestsUsedDuring = options.requestsUsedDuring;
-	const factory: ExtensionFactory = requestsUsedDuring === undefined
-		? ((pi: ExtensionAPI) => {
-			liveObserve(pi, { fetchImpl });
-		})
-		: ((pi: ExtensionAPI) => {
-			const loaded = loadConfig(supervisorDir, { JEV_LOOP_CONTROL_CONFIG: configPath, [KEY_ENV]: FAKE_KEY });
-			const config = loaded.config ?? defaultConfig();
-			const gateBudget = { requestsUsed: 0, reservedUsd: 0, billedUsd: 0, marketUsd: 0, unknownCosts: 0 };
-			liveObserve(pi, {
-				client: createHttpClient({
-					endpoint: config.jev.endpoint,
-					model: config.jev.model,
-					apiKeyEnv: KEY_ENV,
-					deadlineMs: config.jev.deadlineMs,
-					maxRequestBytes: config.jev.maxRequestBytes,
-					maxResponseBytes: config.jev.maxResponseBytes,
-					secrets: [FAKE_KEY],
-					fetchImpl,
-					env: { ...process.env, [KEY_ENV]: FAKE_KEY },
-					retryBudget: ({ attempts }) => {
-						gateBudget.requestsUsed = requestsUsedDuring + Math.max(0, attempts - 1);
-						gateBudget.reservedUsd = config.budget.reserveUsdPerRequest * attempts;
-						return retryRequestBudget(config, gateBudget);
-					},
-				}),
-			});
-		});
+	// The client, the retry gate, the shared budget object, and every
+	// counter are production code inside liveObserve.
+	const factory: ExtensionFactory = (pi: ExtensionAPI) => {
+		liveObserve(pi, { fetchImpl });
+	};
 
 	const fixture = await createFixture({
 		script: [
@@ -272,7 +241,7 @@ test("accounting: maxRequests 1 denies the retry at the real gate, maxRequests 2
 
 	// A cap of 2 has exactly one retry's room: the second dispatch goes out, and
 	// the gate denies the third with the attempts already dispatched (2/2).
-	const allowed = await runRetryFixture(t, { script: [503, 503, 200], billedUsd: 0.05, budget: { maxRequests: 2 }, requestsUsedDuring: 1 });
+	const allowed = await runRetryFixture(t, { script: [503, 503, 200], billedUsd: 0.05, budget: { maxRequests: 2 } });
 	assert.equal(allowed.calls, 2, "a request cap of 2 leaves exactly one retry's room");
 	assert.equal(retryView(allowed).attempts, 2);
 	assert.match(retryView(allowed).note ?? "", /http 503: no retry \(request cap reached \(2\/2\)\)/);
@@ -280,7 +249,7 @@ test("accounting: maxRequests 1 denies the retry at the real gate, maxRequests 2
 });
 
 test("accounting: maxRequests 3 spends the cap on exactly two retries and stops at 3 attempts", { timeout: 120_000 }, async (t) => {
-	const capped = await runRetryFixture(t, { script: [503, 503, 503, 200], billedUsd: 0.05, budget: { maxRequests: 3 }, requestsUsedDuring: 1 });
+	const capped = await runRetryFixture(t, { script: [503, 503, 503, 200], billedUsd: 0.05, budget: { maxRequests: 3 } });
 	assert.equal(capped.calls, 3, "the initial request plus two retries exhaust the cap; no fourth goes out");
 	assert.equal(retryView(capped).attempts, 3);
 	assert.match(retryView(capped).note ?? "", /http 503: no retry \(request cap reached \(3\/3\)\)/);
@@ -308,6 +277,22 @@ test("gate: retry budget ignores the assessment cap and keeps the ordinary prefl
 
 // Sanity: loadConfig really reads the fixture dir the way production does, so a
 // silently-missing config cannot turn these into unlimited-budget no-ops.
+test("accounting: allowanceUsd cap stops dispatch after 2 requests with persistent 503s", { timeout: 60_000 }, async (t) => {
+	const run = await runRetryFixture(t, {
+		script: [503],
+		billedUsd: null,
+		budget: { allowanceUsd: 0.025, reserveUsdPerRequest: 0.01 },
+	});
+	assert.equal(run.calls, 2, "allowance cap allows exactly 2 dispatches (2 * 0.01 <= 0.025, 3 * 0.01 > 0.025)");
+	const view = retryView(run);
+	assert.equal(view.attempts, 2);
+	assert.match(view.note ?? "", /http 503: no retry \(allowance exhausted \(projected .* > .*\)/);
+	const { requests, budget } = counters(run);
+	assert.equal(requests, 2);
+	assert.equal(budget.unknownCosts, 2, "both dispatched 503s have unknown costs");
+	assert.ok(Math.abs((budget.reservedUsd ?? 0) - 0.02) < 1e-9, `two reservations stay armed: ${budget.reservedUsd}`);
+});
+
 test("fixture: the adapter's own config carries the caps under test", () => {
 	const dir = mkdtempSync(join(tmpdir(), "jev-retry-cfg-"));
 	try {

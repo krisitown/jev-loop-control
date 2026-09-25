@@ -120,13 +120,6 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 		// gate reads this shared object: the adapter mutates it in place, and the
 		// transport sees the counts as they are at the moment a 503 arrives.
 		const budgetProbe: BudgetState = { requestsUsed: 0, reservedUsd: 0, billedUsd: 0, marketUsd: 0, unknownCosts: 0 };
-		// Requests whose REAL accounting is still unsettled: an assessment reserves
-		// its request and reservation here at dispatch and releases it at settlement.
-		// A 503 retry is settled by the SAME assessment promise, so during the retry
-		// wait the in-flight assessment's request and reservation are exactly what the
-		// gate must count, with nothing added and nothing counted twice.
-		let requestsInFlight = 0;
-		let reservedInFlightUsd = 0;
 
 		const client = dependencies?.client ?? createHttpClient({
 			endpoint: config.jev.endpoint,
@@ -146,7 +139,17 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			// (the adapter's own counter only learns the total at settlement), so
 			// `budget.maxRequests` really does decide whether the next request goes
 			// out, and an already-dispatched attempt is never counted twice.
-			retryBudget: ({ attempts }) => retryRequestBudget(config, inflightBudget(attempts)),
+			retryBudget: ({ attempts }) => {
+				const extra = Math.max(0, attempts - 1);
+				const probe: BudgetState = {
+					requestsUsed: budgetProbe.requestsUsed + extra,
+					reservedUsd: budgetProbe.reservedUsd + extra * config.budget.reserveUsdPerRequest,
+					billedUsd: budgetProbe.billedUsd,
+					marketUsd: budgetProbe.marketUsd,
+					unknownCosts: budgetProbe.unknownCosts,
+				};
+				return retryRequestBudget(config, probe);
+			},
 		});
 
 		state = {
@@ -751,35 +754,6 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			note: retryOutcomeNote(a),
 			counters: { requests: s.budget.requestsUsed, assessments: s.assessmentsUsed },
 		});
-	}
-
-	/**
-	 * The budget the retry gate sees: the settled accounting plus every request
-	 * still unsettled in the adapter, and, for a retry inside the assessment that
-	 * dispatched it (`attempts >= 1`), the in-flight assessment's own dispatched
-	 * attempt and armed reservation, which THAT assessment already owns. With
-	 * `attempts: 0` nothing is added, so the ordinary preflight stays exactly as
-	 * if no retry were being considered.
-	 */
-	function inflightBudget(attempts: number): BudgetState {
-		const own = Math.max(0, attempts);
-		return {
-			requestsUsed: budgetProbe.requestsUsed + requestsInFlight + own,
-			reservedUsd: budgetProbe.reservedUsd + reservedInFlightUsd + config.budget.reserveUsdPerRequest * own,
-			billedUsd: budgetProbe.billedUsd,
-			marketUsd: budgetProbe.marketUsd,
-			unknownCosts: budgetProbe.unknownCosts,
-		};
-	}
-
-	/**
-	 * A 503 that the transport will not retry, and why; null when there was no
-	 * 503 or a retry was taken. The transport asked its gate with `attempts: 0`
-	 * (nothing dispatched), so the adapter answers with the same rule, counted
-	 * against the real settled budget plus the in-flight dispatches.
-	 */
-	function retryRefusalReason(): string | null {
-		return retryRequestBudgetReason(config, inflightBudget(0));
 	}
 
 	/** The retry status the transport reported, or null when there was no 503. */

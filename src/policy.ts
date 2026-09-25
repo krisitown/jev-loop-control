@@ -107,8 +107,7 @@ export function decideDirection(input: PolicyInput): Decision {
 		};
 	}
 	// A requirement focus counts as actionable only when it names a real
-	// requirement with sufficient support. NONE/UNKNOWN are absences of focus, so
-	// only then may the measured repeated failure stand in as the focus.
+	// requirement with sufficient support. NONE/UNKNOWN are absences of focus.
 	const actionableFocus = focus !== undefined
 		&& !(NON_VETO_OPTIONS as readonly string[]).includes(focus.selected)
 		&& focus.probability >= config.policy.probabilityThreshold
@@ -116,16 +115,6 @@ export function decideDirection(input: PolicyInput): Decision {
 	// The measured repeated failure is a FALLBACK only: it never replaces a strong
 	// requirement-specific focus, and it is never described as a missing focus.
 	const repeatedFailure = actionableFocus ? null : repeatedFailureFocus(snapshot, config, repeat);
-	if (POLICY_INVARIANTS.requireActionableFocus && !actionableFocus && repeatedFailure === null) {
-		return {
-			assessment,
-			apply: "none",
-			status: "UNRESOLVED",
-			reasons: [...reasons, `no_actionable_focus: focus_requirement=${focus?.selected ?? "missing"} (p=${(focus?.probability ?? 0).toFixed(3)}) and no measured repeated failure; a mode alone is not grounds to block, and the step is not certified either`],
-			memo: null,
-			focusKey: null,
-		};
-	}
 	if (config.limits.maxInterventionsPerTask !== null && counters.interventionsUsed >= config.limits.maxInterventionsPerTask) {
 		return {
 			assessment,
@@ -136,9 +125,11 @@ export function decideDirection(input: PolicyInput): Decision {
 			focusKey: null,
 		};
 	}
-	const focusKey = repeatedFailure === null
-		? `direction:${nextStep.selected}:${focus?.selected ?? "none"}`
-		: `direction:${nextStep.selected}:repeat:${repeatedFailure.toolName}:${repeatedFailure.argsHash.slice(0, 12)}`;
+	const focusKey = actionableFocus
+		? `direction:${nextStep.selected}:${focus!.selected}`
+		: repeatedFailure !== null
+			? `direction:${nextStep.selected}:repeat:${repeatedFailure.toolName}:${repeatedFailure.argsHash.slice(0, 12)}`
+			: `direction:${nextStep.selected}:generic`;
 	if (counters.lastFocusKey === focusKey && !counters.newEvidence) {
 		return {
 			assessment,
@@ -154,22 +145,33 @@ export function decideDirection(input: PolicyInput): Decision {
 	// Which focus this decision acts on, stated honestly in both directions: a
 	// repeated failure never claims a focus was unavailable, and a requirement
 	// focus never claims to be a repetition finding.
-	const focusReason = actionableFocus
-		? [
+	let focusReason: string[];
+	let memo: string;
+	if (actionableFocus) {
+		focusReason = [
 			...reasons,
 			`next_step=${nextStep.selected} (p=${nextStep.probability.toFixed(3)}, gap=${nextStep.gap.toFixed(3)})`,
 			`focus=${focus!.selected} (p=${focus!.probability.toFixed(3)})`,
 			...(alsoRepeated !== null ? [`measured identical failures also present (${alsoRepeated.evidenceIds.join(", ")}); the requirement focus stays primary`] : []),
-		]
-		: [...reasons, `repeated_failure_focus: no valid requirement focus was identified, and ${repeatedFailure!.toolName} failed with identical arguments in ${repeatedFailure!.evidenceIds.join(", ")} while this proposal repeats that exact call`];
+		];
+		memo = directionMemo(nextStep.selected as WorkMode, requirement, snapshot);
+	}
+	else if (repeatedFailure !== null) {
+		focusReason = [...reasons, `repeated_failure_focus: no valid requirement focus was identified, and ${repeatedFailure.toolName} failed with identical arguments in ${repeatedFailure.evidenceIds.join(", ")} while this proposal repeats that exact call`];
+		memo = repeatedFailureMemo(nextStep.selected as WorkMode, repeatedFailure, snapshot);
+	}
+	else {
+		// Generic usefulness: Jev judged another next step more useful without
+		// identifying a specific requirement defect or repeated failure.
+		focusReason = [...reasons, `generic_usefulness: next_step=${nextStep.selected} (p=${nextStep.probability.toFixed(3)}, gap=${nextStep.gap.toFixed(3)}) is strongly supported; no specific requirement defect or repeated failure was identified, but a different next step is judged more useful`];
+		memo = genericUsefulnessMemo(nextStep.selected as WorkMode, snapshot);
+	}
 	return {
 		assessment,
 		apply: "block",
 		status: nextStep.selected as Decision["status"],
 		reasons: focusReason,
-		memo: actionableFocus
-			? directionMemo(nextStep.selected as WorkMode, requirement, snapshot)
-			: repeatedFailureMemo(nextStep.selected as WorkMode, repeatedFailure!, snapshot),
+		memo,
 		focusKey,
 	};
 }
@@ -443,6 +445,15 @@ function directionMemo(mode: WorkMode, requirement: Requirement | undefined, sna
 		`The proposed actions were not executed because the current step needs ${mode.toLowerCase()} before it addresses ${focus}.`,
 		`This decision came from an assessment of the supplied evidence; it is not a tool failure, a permission denial, or a safety judgement.`,
 		`Revise the step against the evidence (recent actions and observed results) before proposing another implementation step. Keep the original task and Pi's normal controls unchanged.`,
+		`Evidence revision: ${snapshot.scope.snapshotHash}`,
+	].join("\n");
+}
+
+function genericUsefulnessMemo(mode: WorkMode, snapshot: EvidenceSnapshot): string {
+	return [
+		`[Supervisor intervention: ${mode}]`,
+		`Jev recommends this route before proposed action to advance current goal.`,
+		`Take direct useful next action using available evidence (no mandatory lengthy plan or recap).`,
 		`Evidence revision: ${snapshot.scope.snapshotHash}`,
 	].join("\n");
 }
