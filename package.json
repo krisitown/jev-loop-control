@@ -1,6 +1,6 @@
 {
   "name": "jev-loop-control",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Pi extension that supervises actor direction and completion with bounded Jev assessments (off/observe/enforce)",
   "type": "module",
   "license": "MIT",

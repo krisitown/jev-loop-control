@@ -225,6 +225,34 @@ test("snapshot: historical arguments are bounded to a 600-char summary, current 
 	assert.equal((snap.representation.context_selection as { arguments_truncated_count: number }).arguments_truncated_count, 1);
 });
 
+test("snapshot: retained observation.arguments themselves are bounded, not only recent_actions", () => {
+	// A 20k-character OLD write used to be copied in full into snapshot.observations
+	// (and therefore into evidence.observations), blowing the request guard even
+	// though recent_actions summarized it.
+	const oldPayload = "v".repeat(20_000);
+	const oldWrite = assistant("earlier", [{ id: "old-1", name: "write", arguments: { path: "big.ts", content: oldPayload } }]);
+	const oldResult = toolResult("old-1", "wrote big.ts");
+	const target = assistant("now", [{ id: "new-1", name: "write", arguments: { path: "now.ts", content: oldPayload } }]);
+	const snap = build([oldWrite, oldResult, target], target, ["old-1"]);
+
+	const historical = snap.observations[0]!;
+	assert.ok(JSON.stringify(historical.toolCallId).length > 0);
+	assert.ok(!JSON.stringify(historical.arguments).includes(oldPayload), "the old 20k write content is not sent");
+	assert.ok(JSON.stringify(historical.arguments).length < 800, `historical arguments are bounded, got ${JSON.stringify(historical.arguments).length}`);
+	assert.ok((historical.arguments as { _summary: string })._summary.includes("[ELIDED]"), "the summary says it was bounded");
+	// The hash still describes the COMPLETE original arguments.
+	assert.equal(historical.argsHash, hashJson({ path: "big.ts", content: oldPayload }), "original argsHash preserved");
+	assert.notEqual(historical.argsHash, hashJson(historical.arguments), "the bounded view is never presented as the real arguments");
+
+	// The current proposal is untouched: complete arguments, complete content.
+	const proposalCall = snap.toolCalls[0]!;
+	assert.equal((proposalCall.arguments as { content: string }).content.length, 20_000, "proposal arguments stay complete");
+	assert.ok(JSON.stringify(snap.representation.proposal).includes(oldPayload), "and the proposal carries the full payload");
+	assert.ok(JSON.stringify(snap.representation).includes(oldPayload), "exactly one full copy survives: the proposal's");
+	assert.equal(JSON.stringify(snap.representation).split(oldPayload).length - 1, 1, "never duplicated into observations");
+	assert.equal(snap.truncated, false, "bounding historical arguments is not a truncated proposal");
+});
+
 test("snapshot: result truncation metadata is keyed by evidence id, never by a redacted tool-call id", () => {
 	// The tool-call id itself carries the secret, so a lookup of the raw message by
 	// the REDACTED id would miss and report 0 chars for a 3000-char result.

@@ -106,23 +106,25 @@ export function decideDirection(input: PolicyInput): Decision {
 			focusKey: null,
 		};
 	}
-	// The one measured fact that can stand in for an unlocatable requirement: the
-	// executed path already shows this same action failing repeatedly. That is an
-	// observation, not an invented focus, so it is allowed as a focus fallback.
-	const repeatedFailure = repeatedFailureFocus(snapshot, config, repeat);
-	if (POLICY_INVARIANTS.requireActionableFocus) {
-		if (focus === undefined || NON_VETO_OPTIONS.includes(focus.selected) || focus.probability < config.policy.probabilityThreshold) {
-			if (repeatedFailure === null) {
-				return {
-					assessment,
-					apply: "none",
-					status: "UNRESOLVED",
-					reasons: [...reasons, `no_actionable_focus: focus_requirement=${focus?.selected ?? "missing"} (p=${(focus?.probability ?? 0).toFixed(3)}) and no measured repeated failure; a mode alone is not grounds to block, and the step is not certified either`],
-					memo: null,
-					focusKey: null,
-				};
-			}
-		}
+	// A requirement focus counts as actionable only when it names a real
+	// requirement with sufficient support. NONE/UNKNOWN are absences of focus, so
+	// only then may the measured repeated failure stand in as the focus.
+	const actionableFocus = focus !== undefined
+		&& !(NON_VETO_OPTIONS as readonly string[]).includes(focus.selected)
+		&& focus.probability >= config.policy.probabilityThreshold
+		&& snapshot.task.requirements.some((candidate) => candidate.id === focus.selected);
+	// The measured repeated failure is a FALLBACK only: it never replaces a strong
+	// requirement-specific focus, and it is never described as a missing focus.
+	const repeatedFailure = actionableFocus ? null : repeatedFailureFocus(snapshot, config, repeat);
+	if (POLICY_INVARIANTS.requireActionableFocus && !actionableFocus && repeatedFailure === null) {
+		return {
+			assessment,
+			apply: "none",
+			status: "UNRESOLVED",
+			reasons: [...reasons, `no_actionable_focus: focus_requirement=${focus?.selected ?? "missing"} (p=${(focus?.probability ?? 0).toFixed(3)}) and no measured repeated failure; a mode alone is not grounds to block, and the step is not certified either`],
+			memo: null,
+			focusKey: null,
+		};
 	}
 	if (config.limits.maxInterventionsPerTask !== null && counters.interventionsUsed >= config.limits.maxInterventionsPerTask) {
 		return {
@@ -147,17 +149,27 @@ export function decideDirection(input: PolicyInput): Decision {
 			focusKey,
 		};
 	}
-	const requirement = snapshot.task.requirements.find((candidate) => candidate.id === focus?.selected);
+	const requirement = actionableFocus ? snapshot.task.requirements.find((candidate) => candidate.id === focus!.selected) : undefined;
+	const alsoRepeated = actionableFocus ? repeatedFailureFocus(snapshot, config, repeat) : null;
+	// Which focus this decision acts on, stated honestly in both directions: a
+	// repeated failure never claims a focus was unavailable, and a requirement
+	// focus never claims to be a repetition finding.
+	const focusReason = actionableFocus
+		? [
+			...reasons,
+			`next_step=${nextStep.selected} (p=${nextStep.probability.toFixed(3)}, gap=${nextStep.gap.toFixed(3)})`,
+			`focus=${focus!.selected} (p=${focus!.probability.toFixed(3)})`,
+			...(alsoRepeated !== null ? [`measured identical failures also present (${alsoRepeated.evidenceIds.join(", ")}); the requirement focus stays primary`] : []),
+		]
+		: [...reasons, `repeated_failure_focus: no valid requirement focus was identified, and ${repeatedFailure!.toolName} failed with identical arguments in ${repeatedFailure!.evidenceIds.join(", ")} while this proposal repeats that exact call`];
 	return {
 		assessment,
 		apply: "block",
 		status: nextStep.selected as Decision["status"],
-		reasons: repeatedFailure === null
-			? [...reasons, `next_step=${nextStep.selected} (p=${nextStep.probability.toFixed(3)}, gap=${nextStep.gap.toFixed(3)})`, `focus=${focus?.selected ?? "none"} (p=${(focus?.probability ?? 0).toFixed(3)})`]
-			: [...reasons, `repeated_failure_focus: ${repeatedFailure.toolName} failed with identical arguments in ${repeatedFailure.evidenceIds.join(", ")} and this proposal repeats that exact call; no requirement-specific focus was identified`],
-		memo: repeatedFailure === null
+		reasons: focusReason,
+		memo: actionableFocus
 			? directionMemo(nextStep.selected as WorkMode, requirement, snapshot)
-			: repeatedFailureMemo(nextStep.selected as WorkMode, repeatedFailure, snapshot),
+			: repeatedFailureMemo(nextStep.selected as WorkMode, repeatedFailure!, snapshot),
 		focusKey,
 	};
 }

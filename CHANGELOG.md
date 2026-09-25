@@ -1,13 +1,33 @@
 # Changelog
 
-Notable changes to `jev-loop-control`. Entries describe shipped behaviour only.
-Measured experiment results are published separately once they are verified, so
-no entry here claims a quality improvement.
+Notable changes to `jev-loop-control`. Entries describe behaviour present in the
+code at the referenced commit, plus how far it was checked. Effectiveness claims
+belong to measured results, which are recorded separately from this file. Where an
+entry is a development milestone rather than a published release, it says so.
 
-## 0.3.0 - Unreleased
+## 0.3.1 - Current candidate
 
-Validation pending. The behaviour described in the 0.2.0 checkpoint below is
-unfinished and may change before this version ships.
+Patch on top of the 0.3.0 development milestone (`5b83579`, 153 tests passing).
+
+### Fixed
+
+- Historical observation arguments in the evidence payload are bounded, while
+  argument hashes and the current proposal's arguments stay intact. Long old
+  arguments no longer crowd out the proposal under review.
+- A strong requirement-specific steering focus is kept over the repeated-failure
+  fallback, so a concrete requirement gap is not replaced by generic failure
+  advice.
+
+### Testing
+
+- Covered by pure failure/success regression tests. Effectiveness has not been
+  measured; no result is claimed here.
+
+## 0.3.0 - Development milestone (validated offline, not tagged or published)
+
+Committed as `5b83579`. Offline suite green at that commit: 153 tests. No tag and
+no publication followed. The capability descriptions in the 0.2.0 checkpoint below
+remained accurate for this milestone.
 
 ## 0.2.0 - Development checkpoint (not a validated release)
 

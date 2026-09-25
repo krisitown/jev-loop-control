@@ -423,6 +423,10 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 	// up later by its (redacted) tool-call id would compare a sanitized id against
 	// unsanitized messages and silently report zeros for any id carrying a secret.
 	const truncationById = new Map<string, ObservationTruncation>();
+	// Same rule for arguments: the observation carries a bounded SUMMARY, and the
+	// hash stays that of the COMPLETE arguments. Capping only `recent_actions` was
+	// not enough, because `observations` shipped the full old write content too.
+	const boundedArgsById = new Map<string, { value: unknown; truncated: boolean; chars: number }>();
 	for (const message of input.messages) {
 		if (!isToolResultMessage(message)) {
 			continue;
@@ -432,6 +436,13 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 		const toolCallId = scrub(rawCallId);
 		const found = callsById.get(rawCallId);
 		const id = `E${observationsAll.length + 1}`;
+		if (found) {
+			const rendered = JSON.stringify(found.arguments);
+			const bounded = capTo(rendered, OBSERVATION_ARGS_CHARS);
+			boundedArgsById.set(id, bounded.truncated
+				? { value: { _summary: bounded.text, _original_chars: bounded.chars }, truncated: true, chars: bounded.chars }
+				: { value: found.arguments, truncated: false, chars: rendered.length });
+		}
 		// Result text is bounded, and the bound is visible in `representation`.
 		const capped = capTo(scrub(visibleText(message)), OBSERVATION_TEXT_CHARS);
 		truncationById.set(id, {
@@ -451,7 +462,7 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 			// marker text), so cap content at `budget - markerOverhead(budget)` to make
 			// the retained text exactly `OBSERVATION_TEXT_CHARS`.
 			text: capped.text,
-			...(found ? { arguments: found.arguments, argsHash: found.argsHash } : {}),
+			...(found ? { arguments: boundedArgsById.get(id)!.value, argsHash: found.argsHash } : {}),
 		});
 	}
 	// Retention: the most recent RECENT_RESULTS results, plus the most recent
@@ -473,9 +484,9 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 	const truncationMeta = retained.map((observation) => truncationById.get(observation.id)!);
 
 	const argumentsTruncatedCount = observationsAll
-			.slice(-RECENT_ACTIONS_WINDOW)
-			.filter((observation) => observation.arguments !== undefined && JSON.stringify(observation.arguments).length > OBSERVATION_ARGS_CHARS)
-			.length;
+		.slice(-RECENT_ACTIONS_WINDOW)
+		.filter((observation) => boundedArgsById.get(observation.id)?.truncated === true)
+		.length;
 
 	const proposalText = scrub(visibleText(input.target));
 	// History excludes the candidate itself: `final_answer` must be the current
@@ -523,28 +534,24 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 		recent_actions: (() => {
 			const recent = observationsAll.slice(-RECENT_ACTIONS_WINDOW);
 			return recent.map((observation) => {
-				// Historical arguments are bounded to a summary; the ORIGINAL argument
-				// hash is kept so a repeat is still detected exactly. The current
+				// Observation arguments are already bounded at creation; the ORIGINAL
+				// argument hash is kept so a repeat is still detected exactly. The current
 				// proposal's own arguments are never bounded (see `proposal.tool_calls`).
-				let args = observation.arguments;
-				let argsTruncated = false;
-				let argsChars: number | undefined;
-				if (args !== undefined) {
-					const strArgs = JSON.stringify(args);
-					const capped = capTo(strArgs, OBSERVATION_ARGS_CHARS);
-					if (capped.truncated) {
-						args = { _summary: capped.text, _original_chars: capped.chars };
-						argsTruncated = true;
-						argsChars = capped.chars;
-					}
-				}
+				const bounded = boundedArgsById.get(observation.id);
 				return {
 					tool: observation.toolName,
 					tool_call_id: observation.toolCallId,
 					result: observation.ok ? "success" : "error",
 					executed: observation.provenance === "executed",
 					evidence_id: observation.id,
-					...(args !== undefined ? { arguments: args, arguments_hash: observation.argsHash, arguments_truncated: argsTruncated, ...(argsChars !== undefined ? { arguments_chars: argsChars } : {}) } : {}),
+					...(observation.arguments !== undefined
+						? {
+							arguments: observation.arguments,
+							arguments_hash: observation.argsHash,
+							arguments_truncated: bounded?.truncated === true,
+							...(bounded?.truncated ? { arguments_chars: bounded.chars } : {}),
+						}
+						: {}),
 				};
 			});
 		})(),

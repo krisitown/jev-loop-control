@@ -2,11 +2,11 @@
 
 Pi extension that supervises actor direction and completion with bounded Jev assessments.
 
-Jev checks the actor's proposed tools and completion status, applying bounded interventions when necessary. It works alongside the actor model you already use in Pi: **your configured Pi model stays the actor.** This build does not change that, and it does not claim better output — the effect on quality is not yet measured.
+Jev checks the actor's proposed tools and completion status, applying bounded interventions when necessary. It works alongside the actor model you already use in Pi: **your configured Pi model stays the actor.** This version does not change that.
 
-**Version:** 0.3.0 (Unreleased development build, pending validation) · See [CHANGELOG.md](CHANGELOG.md).
+**Version:** 0.3.1 (candidate) · See [CHANGELOG.md](CHANGELOG.md).
 
-The current tree is an unreleased development build. It is not validated, and effectiveness has not been measured. Do not present it as a release.
+Jev supervises and, in `enforce`, redirects work that its evidence does not support. Whether that improves your outcomes is yours to measure: this project makes no proven-effectiveness claim, and traces plus statuses are written so you can check each decision yourself.
 
 ## Requirements
 
@@ -239,7 +239,7 @@ Tests use synthetic data and do not require paid credentials.
 
 ## Known Limitations
 
-- Improved output quality is unproven; no experiment has verified it yet.
+- Improved output quality is not proven here; measure it on your own workloads.
 - Evidence is bounded by design. Jev does not see the entire context window.
 - Recovery guidance state is in memory only; it is not rebuilt after a restart.
 - Gateway cost fields may remain unknown; reservations are kept in these cases.

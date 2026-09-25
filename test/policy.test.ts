@@ -399,26 +399,41 @@ test("direction: the same focus and mode without new evidence is suppressed", ()
  * twice, plus a proposal that repeats exactly that call. `proposalArgs` lets a
  * test vary the current proposal while keeping the failure history identical.
  */
-function repeatSnapshot(proposalArgs: Record<string, unknown> = { path: "a.txt", text: "v1" }): ReturnType<typeof snapshot> {
-	const failedCall = (id: string) => assistantTurn(`run ${id}`, [{ id, name: "write", arguments: proposalArgs }]);
+/**
+ * Repeat fixtures are explicit about outcome polarity: `outcomes[i] === true`
+ * means "this executed call FAILED". Failure-only and success-only fixtures are
+ * used separately, because a mixed fixture once let an inverted `ok` comparison
+ * pass by counting successes instead of failures.
+ */
+function repeatSnapshot(proposalArgs: Record<string, unknown> = { path: "a.txt", text: "v1" }, outcomes: readonly boolean[] = [true, true, true]): ReturnType<typeof snapshot> {
+	return repeatSnapshotFromCalls(proposalArgs, proposalArgs, outcomes);
+}
+
+/** Same fixture, but the current proposal may differ from the historical calls. */
+function repeatSnapshotFromCalls(historyArgs: Record<string, unknown>, proposalArgs: Record<string, unknown>, outcomes: readonly boolean[]): ReturnType<typeof snapshot> {
+	const call = (id: string, args: Record<string, unknown>) => assistantTurn(`run ${id}`, [{ id, name: "write", arguments: args }]);
 	const messages: Msg[] = [];
 	// Two older results outside the six-observation window: they must not trigger.
-	messages.push(failedCall("c-old-1"), toolResult("c-old-1", "old failure", { isError: true, toolName: "write" }));
-	messages.push(failedCall("c-old-2"), toolResult("c-old-2", "old failure", { isError: true, toolName: "write" }));
-	// The six executed observations that matter: E3..E8 in the snapshot.
-	const recent = [
-		["c1", false], ["c2", true], ["c3", false], ["c4", true], ["c5", false], ["c6", true],
-	] as const;
-	for (const [id, ok] of recent) {
-		messages.push(failedCall(id), toolResult(id, ok ? "ok" : "failed", { isError: !ok, toolName: "write" }));
+	messages.push(call("c-old-1", historyArgs), toolResult("c-old-1", "old result", { isError: true, ok: false, toolName: "write" }));
+	messages.push(call("c-old-2", historyArgs), toolResult("c-old-2", "old result", { isError: true, ok: false, toolName: "write" }));
+	// The six executed observations inside the window are E3..E8: the probed calls
+	// carry the requested outcome, and the padding always SUCCEEDS with different
+	// arguments, so the polarity of a fixture is never ambiguous.
+	const probed = (outcomes as readonly boolean[]).map((failed, index) => [`p${index + 1}`, failed] as const);
+	const padding: Array<[string, Record<string, unknown>]> = [["q1", { path: "b.txt" }], ["q2", { path: "c.txt" }], ["q3", { path: "d.txt" }]];
+	for (const [id, args] of padding) {
+		messages.push(call(id, args), toolResult(id, "ok", { isError: false, toolName: "write" }));
 	}
-	const target = assistant("same write again", [{ id: "c7", name: "write", arguments: proposalArgs }], "toolUse");
+	for (const [id, failed] of probed) {
+		messages.push(call(id, historyArgs), toolResult(id, failed ? "failed" : "ok", { isError: failed, toolName: "write" }));
+	}
+	const target = assistant("the next proposal", [{ id: "c7", name: "write", arguments: proposalArgs }], "toolUse");
 	messages.push(target);
 	return buildSnapshot({
 		kind: "proposal",
 		target,
 		messages,
-		executedToolCallIds: new Set(["c-old-1", "c-old-2", "c1", "c2", "c3", "c4", "c5", "c6"]),
+		executedToolCallIds: new Set(["c-old-1", "c-old-2", "q1", "q2", "q3", "p1", "p2", "p3"]),
 		requirements: REQ,
 		manifest: false,
 		priorInterventions: [],
@@ -437,8 +452,11 @@ function assistant(text: string, calls: Array<{ id: string; name: string; argume
 	return assistantTurn(text, calls.map((call) => ({ id: call.id, name: call.name, arguments: call.arguments })));
 }
 
-function toolResult(toolCallId: string, text: string, opts: { isError?: boolean; toolName?: string }): Msg {
-	return { role: "toolResult", toolCallId, toolName: opts.toolName ?? "bash", isError: opts.isError ?? false, content: [{ type: "text", text }] };
+function toolResult(toolCallId: string, text: string, opts: { isError?: boolean; ok?: boolean; toolName?: string }): Msg {
+	// `isError` is the flag buildSnapshot derives `ok` from; keep the fixture
+	// honest so it can never claim a failure the snapshot does not record.
+	const isError = opts.isError ?? opts.ok === false;
+	return { role: "toolResult", toolCallId, toolName: opts.toolName ?? "bash", isError, content: [{ type: "text", text }] };
 }
 
 const STRONG_RESEARCH = ns({ RESEARCH: 0.9, PROCEED: 0.05, REPLAN: 0.02, VERIFY: 0.02, UNCERTAIN: 0.01 }, "RESEARCH");
@@ -474,11 +492,15 @@ test("repeated failure: never fires on the repetition diagnostic alone (no measu
 });
 
 test("repeated failure: a proposal that changes the arguments is not a repeat", () => {
-	const changed = repeatSnapshot({ path: "a.txt", text: "v1" });
+	const changed = repeatSnapshotFromCalls(
+		{ path: "a.txt", text: "v1" },
+		{ path: "a.txt", text: "materially different approach" },
+		[true, true, true],
+	);
 	const decision = decideDirection({
 		kind: "direction",
 		assessment: assessment({ next_step: STRONG_RESEARCH, unproductive_repeat: { type: "noul", questionId: "unproductive_repeat", noul: 0.9 }, focus_requirement: NO_FOCUS }),
-		snapshot: changedWithDifferentArgs(changed),
+		snapshot: changed,
 		config: config(),
 		counters,
 	});
@@ -486,17 +508,37 @@ test("repeated failure: a proposal that changes the arguments is not a repeat", 
 	assert.equal(decision.status, "UNRESOLVED");
 });
 
-/** Same evidence, but the current proposal calls the tool with different arguments. */
-function changedWithDifferentArgs(snap: EvidenceSnapshot): EvidenceSnapshot {
-	const args = { path: "a.txt", text: "materially different approach" };
-	const call = { id: "c7", name: "write", arguments: args, argsHash: hashJsonForTest(args) };
-	return { ...snap, toolCalls: [call] };
-}
+test("repeated failure: identical SUCCESSFUL calls never trigger the fallback", () => {
+	const allSuccess = repeatSnapshot({ path: "a.txt", text: "v1" }, [false, false, false]);
+	const detector = repeatedFailureFocus(allSuccess, config(), 0.9);
+	assert.equal(detector, null, "the detector keys on executed failures, not on repeated calls");
+	const decision = decideDirection({
+		kind: "direction",
+		assessment: assessment({ next_step: STRONG_RESEARCH, unproductive_repeat: { type: "noul", questionId: "unproductive_repeat", noul: 0.9 }, focus_requirement: NO_FOCUS }),
+		snapshot: allSuccess,
+		config: config(),
+		counters,
+	});
+	assert.equal(decision.apply, "none", "repeating a call that succeeded is not a repeated failure");
+	assert.equal(decision.status, "UNRESOLVED");
+	assert.ok(decision.reasons.some((r) => r.includes("no_actionable_focus")), decision.reasons.join(";"));
+});
 
-function hashJsonForTest(value: unknown): string {
-	// Any value distinct from the failed calls' hash is enough: policy compares hashes.
-	return `different-hash:${JSON.stringify(value).length}`;
-}
+test("repeated failure: two real executed failures trigger it even among successes", () => {
+	const mixed = repeatSnapshot({ path: "a.txt", text: "v1" }, [true, true, false]);
+	assert.ok(repeatedFailureFocus(mixed, config(), 0.9), "two failures inside the window are enough");
+	const decision = decideDirection({
+		kind: "direction",
+		assessment: assessment({ next_step: STRONG_RESEARCH, unproductive_repeat: { type: "noul", questionId: "unproductive_repeat", noul: 0.9 }, focus_requirement: NO_FOCUS }),
+		snapshot: mixed,
+		config: config(),
+		counters,
+	});
+	assert.equal(decision.apply, "block");
+	assert.ok(/\bE\d/.test(decision.memo!), "the memo cites the failing evidence ids");
+});
+
+
 
 test("repeated failure: below the diagnostic threshold the measured repeat still does not fire", () => {
 	const decision = decideDirection({
@@ -532,4 +574,80 @@ test("repeated failure: the detector requires executed failures with identical a
 	assert.ok(repeatedFailureFocus(snap, config(), 0.9), "the fixture itself must contain the measured repeat");
 	assert.equal(repeatedFailureFocus(snap, config(), 0.5), null, "the diagnostic threshold is required");
 	assert.equal(repeatedFailureFocus(snapshot(REQ), config(), 0.9), null, "no executed failures, no fallback");
+});
+
+test("REVIEW 29.1: the detector counts executed FAILURES with identical args, never successes", () => {
+	// One fixture per polarity, so a wrong `ok` comparison cannot pass both.
+	const args = { path: "a.txt", text: "same call" };
+	const failures = repeatSnapshotFromCalls(args, args, [true, true, true]);
+	const successes = repeatSnapshotFromCalls(args, args, [false, false, false]);
+	assert.deepEqual(repeatedFailureFocus(failures, config(), 0.9)?.evidenceIds, ["E6", "E7", "E8"], "the executed window failures are what trigger");
+	assert.equal(repeatedFailureFocus(successes, config(), 0.9), null, "identical successes never trigger");
+	// A proposal that repeats nothing is out regardless of the history polarity.
+	const changed = repeatSnapshotFromCalls(args, { path: "a.txt", text: "changed" }, [false, false, false]);
+	assert.equal(repeatedFailureFocus(changed, config(), 0.9), null, "a changed proposed call never triggers");
+});
+
+test("REVIEW 29.2: a strong requirement focus stays primary; the fallback never replaces or misdescribes it", () => {
+	const snap = repeatSnapshot();
+	const decision = decideDirection({
+		kind: "direction",
+		// Strong corrective mode AND a strong requirement-specific focus, with a
+		// measured repeated failure present at the same time.
+		assessment: assessment({ next_step: STRONG_RESEARCH, unproductive_repeat: { type: "noul", questionId: "unproductive_repeat", noul: 0.9 }, focus_requirement: ns({ R1: 0.9, R2: 0.05, NONE: 0.03, UNKNOWN: 0.02 }, "R1") }),
+		snapshot: snap,
+		config: config(),
+		counters,
+	});
+	assert.equal(decision.apply, "block");
+	assert.equal(decision.status, "RESEARCH");
+	// The requirement focus drives the guidance, not the repetition fallback.
+	assert.ok(decision.reasons.some((r) => r.startsWith("focus=R1")), decision.reasons.join(";"));
+	assert.ok(decision.memo!.includes("requirement R1"), `the strong requirement focus keeps its memo: ${decision.memo}`);
+	assert.equal(decision.focusKey, "direction:RESEARCH:R1", "the focus key names the requirement, not the repeat");
+	// The false claim must be gone in both directions.
+	assert.ok(!decision.reasons.some((r) => r.includes("no requirement-specific focus was identified")), decision.reasons.join(";"));
+	assert.ok(!decision.reasons.some((r) => r.startsWith("repeated_failure_focus")), "a fallback is not reported when it was not used");
+	// And the repetition evidence is still acknowledged rather than hidden.
+	assert.ok(decision.reasons.some((r) => r.includes("requirement focus stays primary")), decision.reasons.join(";"));
+});
+
+test("REVIEW 29.2: the fallback reports a missing focus only when the focus really is absent", () => {
+	const fallback = decideDirection({
+		kind: "direction",
+		assessment: assessment({ next_step: STRONG_RESEARCH, unproductive_repeat: { type: "noul", questionId: "unproductive_repeat", noul: 0.9 }, focus_requirement: NO_FOCUS }),
+		snapshot: repeatSnapshot(),
+		config: config(),
+		counters,
+	});
+	assert.equal(fallback.apply, "block");
+	assert.ok(fallback.reasons.some((r) => r.startsWith("repeated_failure_focus") && r.includes("no valid requirement focus")), fallback.reasons.join(";"));
+	assert.match(fallback.memo!, /Investigate the cited evidence/);
+	assert.ok(fallback.focusKey!.includes("repeat:"), fallback.focusKey!);
+
+	// A focus that names a requirement not in the task is not a valid focus.
+	const ghost = decideDirection({
+		kind: "direction",
+		assessment: assessment({ next_step: STRONG_RESEARCH, unproductive_repeat: { type: "noul", questionId: "unproductive_repeat", noul: 0.9 }, focus_requirement: ns({ R9: 0.9, NONE: 0.05, UNKNOWN: 0.05 }, "R9") }),
+		snapshot: repeatSnapshot(),
+		config: config(),
+		counters,
+	});
+	assert.equal(ghost.apply, "block", "a strong focus on an unknown requirement is not actionable, so the fallback applies");
+	assert.ok(ghost.reasons.some((r) => r.startsWith("repeated_failure_focus")), ghost.reasons.join(";"));
+});
+
+test("fixture integrity: the repeat fixtures record what their names claim", () => {
+	// Guards the guards: if a fixture silently inverted its outcome flags, every
+	// polarity test above would pass for the wrong reason.
+	const args = { path: "a.txt", text: "same call" };
+	const failing = repeatSnapshotFromCalls(args, args, [true, true, true]);
+	const succeeding = repeatSnapshotFromCalls(args, args, [false, false, false]);
+	const failedIds = failing.observations.filter((o) => o.ok === false).map((o) => o.id);
+	const succeededIds = succeeding.observations.filter((o) => o.ok === true).map((o) => o.id);
+	assert.ok(failedIds.includes("E6") && failedIds.includes("E7") && failedIds.includes("E8"), "the failure fixture really holds executed window failures");
+	assert.ok(failedIds.every((id) => failing.observations.find((o) => o.id === id)?.provenance === "executed"), "every recorded failure is an executed one");
+	// Only the two out-of-window decoys failed; every in-window call succeeded.
+	assert.deepEqual(succeeding.observations.filter((o) => o.ok === false).map((o) => o.id), ["E1", "E2"], "the success fixture has no in-window failure");
+	assert.equal(new Set(failing.toolCalls.map((call) => call.argsHash)).size, 1, "one distinct call is repeated");
 });
