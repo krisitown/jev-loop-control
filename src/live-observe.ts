@@ -13,7 +13,7 @@ import { applyCompletionContinuation, applyDirectionBlock } from "./intervention
 import { assessmentBudgetReason, retryRequestBudget, retryRequestBudgetReason } from "./budget.ts";
 import type { ToolCallEventResult, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import { createRecovery, advanceRecovery, recoveryInstruction, beginRecovery, recoveryEvidenceKey, type RecoveryState, type RecoveryMode } from "./recovery.ts";
-import { buildAssessmentPacket, buildCorrectionQuestions, decideCorrectionAssessment, ledgerFromSnapshot } from "./supervisor-tuning.ts";
+import { buildAssessmentPacket, buildCompletionQuestions, buildCorrectionQuestions, decideCorrectionAssessment, decideTunedCompletion, ledgerFromSnapshot } from "./supervisor-tuning.ts";
 
 interface LiveState {
 	config: SupervisorConfig;
@@ -406,7 +406,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			a.artifacts = { request: requestPath, response: responsePath };
 
 			const decision = s.config.tuning.enabled
-				? decideCorrectionAssessment(a, snapshot, s.config, { budgetAvailable: s.config.limits.maxInterventionsPerTask === null || s.interventionsUsed < s.config.limits.maxInterventionsPerTask })
+				? decideCorrectionAssessment(a, snapshot, s.config, { budgetAvailable: s.config.limits.maxInterventionsPerTask === null || s.interventionsUsed < s.config.limits.maxInterventionsPerTask, packet: tunedPacket!.packet })
 				: decideDirection({ kind: "direction", assessment: a, snapshot, config: s.config, counters: { interventionsUsed: s.interventionsUsed, terminalContinuationsUsed: s.terminalContinuationsUsed, assessmentsUsed: s.assessmentsUsed, lastFocusKey: s.lastFocusKey, newEvidence: s.newEvidence } });
 			if (!a.ok) {
 				const msg = s.scrub(a.failure?.message ?? "assessment failed");
@@ -496,7 +496,16 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 						branch: ctx.sessionManager.getLeafId() ?? "main",
 					},
 				});
-				const questions = buildQuestions("completion", snapshot);
+				let tunedPacket = s.config.tuning.enabled ? buildAssessmentPacket(ledgerFromSnapshot(snapshot), { selector: s.config.tuning.selector, softPayloadBytes: s.config.tuning.softPayloadBytes, assessmentScope: { kind: "completion", targetId: `proposal:${snapshot.target.proposalHash}` } }) : null;
+				let questions = tunedPacket ? buildCompletionQuestions(tunedPacket.packet) : buildQuestions("completion", snapshot);
+				if (tunedPacket) {
+					const firstEnvelope = buildRequestBody({ model: s.config.jev.model, state: tunedPacket.packet as unknown as Record<string, unknown>, questions });
+					if (firstEnvelope.bytes > s.config.tuning.softPayloadBytes) {
+						const reducedPacketTarget = Math.max(1024, s.config.tuning.softPayloadBytes - (firstEnvelope.bytes - tunedPacket.serializedBytes));
+						tunedPacket = buildAssessmentPacket(ledgerFromSnapshot(snapshot), { selector: s.config.tuning.selector, softPayloadBytes: reducedPacketTarget, assessmentScope: { kind: "completion", targetId: `proposal:${snapshot.target.proposalHash}` } });
+						questions = buildCompletionQuestions(tunedPacket.packet);
+					}
+				}
 				const controller = {
 					workMode: s.recovery.active?.mode ?? "EXECUTE",
 					proposalNumber: s.proposalNumber,
@@ -505,7 +514,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 					previousInterventions: s.recovery.history.map(h => ({ kind: h.kind, status: h.status, focus: h.focus, at: h.at })),
 					recoveryObjective: s.recovery.active?.objective,
 				};
-				const stateEnvelope = buildState({ kind: "completion", snapshot, controller, proposalId: s.proposalId });
+				const stateEnvelope = tunedPacket ? tunedPacket.packet as unknown as Record<string, unknown> : buildState({ kind: "completion", snapshot, controller, proposalId: s.proposalId });
 
 				const reserve = s.config.budget.reserveUsdPerRequest;
 				s.budget.reservedUsd += reserve;
@@ -539,7 +548,9 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 					const responsePath = a.responseBody !== undefined ? s.trace.artifact("response", a.responseBody, a.requestId) : null;
 					a.artifacts = { request: requestPath, response: responsePath };
 
-					const decision = decideCompletion({ kind: "completion", assessment: a, snapshot, config: s.config, counters: { interventionsUsed: s.interventionsUsed, terminalContinuationsUsed: s.terminalContinuationsUsed, assessmentsUsed: s.assessmentsUsed, lastFocusKey: s.lastFocusKey, newEvidence: s.newEvidence } });
+					const decision = s.config.tuning.enabled
+						? decideTunedCompletion(a, snapshot, s.config, { budgetAvailable: s.config.limits.maxInterventionsPerTask === null || s.interventionsUsed < s.config.limits.maxInterventionsPerTask, packet: tunedPacket!.packet })
+						: decideCompletion({ kind: "completion", assessment: a, snapshot, config: s.config, counters: { interventionsUsed: s.interventionsUsed, terminalContinuationsUsed: s.terminalContinuationsUsed, assessmentsUsed: s.assessmentsUsed, lastFocusKey: s.lastFocusKey, newEvidence: s.newEvidence } });
 					if (!a.ok) {
 						const msg = s.scrub(a.failure?.message ?? "assessment failed");
 						if (s.lastFailure !== msg) {

@@ -210,6 +210,16 @@ export function buildCorrectionQuestions(packet: AssessmentPacket): ChoiceQuesti
 	];
 }
 
+export function buildCompletionQuestions(packet: AssessmentPacket): ChoiceQuestion[] {
+	const questions = buildCorrectionQuestions(packet);
+	questions.unshift({
+		type: "choice", id: "completion_status", role: "completion_status",
+		instructions: "Assess the actor's exact completion claim against current source-backed obligations and verification. SUPPORTED requires current evidence for the claim. CONTRADICTED requires visible unfinished work or contradictory verification. NOT_ESTABLISHED means coverage or freshness is insufficient; omitted context is not a contradiction. A locally supported contradiction does not require global coverage. Tool execution success is not task success. Each question is independent.",
+		criteria: { SUPPORTED: "Current source-backed evidence supports the exact completion claim.", CONTRADICTED: "Visible current evidence contradicts the completion claim.", NOT_ESTABLISHED: "The supplied evidence cannot establish or contradict completion." },
+	});
+	return questions;
+}
+
 export type CorrectionAction = "none" | "soft" | "strong";
 export type SuppressionReason = "below_soft_threshold" | "below_strong_threshold" | "insufficient_evidence" | "unsupported_grounding" | "already_addressed" | "duplicate_issue" | "cooldown" | "budget" | "unavailable" | "delivery_failed";
 export interface CorrectionProfile { softThreshold: number; strongThreshold: number; softMinGap: number; strongMinGap: number; strongConcerns: string[]; }
@@ -278,31 +288,34 @@ export function shouldScheduleCheckpoint(input: ScheduleInput, profile: Schedule
 
 /** Compatibility adapter from the current immutable snapshot into the v2 ledger. */
 export function ledgerFromSnapshot(snapshot: EvidenceSnapshot): EvidenceLedger {
-	const rep = snapshot.representation as { observations?: Array<Record<string, unknown>>; recent_actions?: Array<Record<string, unknown>> };
+	const rep = snapshot.representation as { history?: { text?: string }; observations?: Array<Record<string, unknown>>; recent_actions?: Array<Record<string, unknown>> };
 	const proposalId = `proposal:${snapshot.target.proposalHash}`;
+	const historyGoal = rep.history?.text?.match(/\[user\]:\s*([\s\S]*?)(?:\n\n\[[a-z]+\]:|$)/i)?.[1]?.trim();
 	return {
-		userGoal: { id: "USER_GOAL", kind: "requirement", text: snapshot.task.requirements[0]?.summary ?? "Current user task", source: snapshot.task.origin, protected: true },
+		userGoal: { id: "USER_GOAL", kind: "requirement", text: historyGoal || "Current user task (full goal unavailable in this snapshot)", source: snapshot.task.origin, protected: true },
 		requirements: snapshot.task.requirements.map((item) => ({ id: item.id, kind: "requirement", text: item.summary, source: item.origin })),
-		proposals: [{ id: proposalId, kind: "proposal", text: snapshot.proposalText, source: snapshot.target.messageRef, protected: true }],
+		proposals: [{ id: proposalId, kind: "proposal", text: [snapshot.proposalText, ...snapshot.toolCalls.map((call) => `${call.name} ${JSON.stringify(call.arguments)}`)].filter(Boolean).join("\n\n"), source: snapshot.target.messageRef, protected: true }],
 		observations: snapshot.observations.map((item) => ({ id: item.id, kind: "observation", text: item.text, source: `${item.toolName}:${item.toolCallId}`, references: item.argsHash ? [item.argsHash] : undefined })),
 		trajectory: (rep.recent_actions ?? []).map((item, index) => ({ id: `trajectory:${index}`, kind: "trajectory", text: JSON.stringify(item), source: "snapshot.recent_actions" })),
 		concerns: snapshot.priorInterventions.map((item, index) => ({ id: `concern:${index}`, kind: "concern", text: item.focus, source: `prior_intervention:${item.at}`, status: "open" })),
 	};
 }
 
-export function decideCorrectionAssessment(assessment: Assessment, snapshot: EvidenceSnapshot, config: SupervisorConfig, flags: { duplicate?: boolean; cooldown?: boolean; budgetAvailable?: boolean } = {}): Decision {
+export function decideCorrectionAssessment(assessment: Assessment, snapshot: EvidenceSnapshot, config: SupervisorConfig, flags: { duplicate?: boolean; cooldown?: boolean; budgetAvailable?: boolean; packet?: AssessmentPacket } = {}): Decision {
 	const answer = (id: string): PolicyAnswer | undefined => {
 		const value = assessment.answers[id];
 		return value?.type === "choice" ? { choice: value.choice, probabilities: value.probabilities } : undefined;
 	};
-	const packet = buildAssessmentPacket(ledgerFromSnapshot(snapshot), { selector: config.tuning.selector, softPayloadBytes: config.tuning.softPayloadBytes, assessmentScope: { kind: snapshot.target.kind, targetId: `proposal:${snapshot.target.proposalHash}` } }).packet;
+	const packet = flags.packet ?? buildAssessmentPacket(ledgerFromSnapshot(snapshot), { selector: config.tuning.selector, softPayloadBytes: config.tuning.softPayloadBytes, assessmentScope: { kind: snapshot.target.kind, targetId: `proposal:${snapshot.target.proposalHash}` } }).packet;
 	const result = evaluateCorrectionPolicy({
 		correction: answer("correction_needed"), concern: answer("primary_concern"), anchor: answer("evidence_anchor"), requirement: answer("requirement_focus"),
 		availableAnchorIds: [...packet.recent_evidence, ...packet.trajectory, ...packet.open_concerns].map((item) => item.id),
 		availableRequirementIds: packet.applicable_requirements.map((item) => item.id), ...flags,
 	}, { softThreshold: config.tuning.softThreshold, strongThreshold: config.tuning.strongThreshold, softMinGap: config.tuning.softMinGap, strongMinGap: config.tuning.strongMinGap, strongConcerns: ["CONTRACT_CONTRADICTION", "CONTRADICTED_DIAGNOSIS", "UNSUPPORTED_COMPLETION"] });
 	const focusKey = result.concern && result.anchorId ? `correction:${result.concern}:${result.anchorId}` : null;
-	const memo = result.action === "none" ? null : `Jev identified ${result.concern} supported by ${result.anchorId}${result.requirementId && !["NONE", "UNKNOWN"].includes(result.requirementId) ? ` and ${result.requirementId}` : ""}. Reassess the disputed assumption, choose the next useful action, and verify the concern is resolved.`;
+	const anchor = [...packet.recent_evidence, ...packet.trajectory, ...packet.open_concerns].find((item) => item.id === result.anchorId);
+	const requirement = packet.applicable_requirements.find((item) => item.id === result.requirementId);
+	const memo = result.action === "none" ? null : `Jev identified ${result.concern}. Evidence (${anchor?.id ?? "unknown"}): ${anchor?.text.slice(0, 500) ?? "unavailable"}${requirement ? ` Requirement (${requirement.id}): ${requirement.text.slice(0, 500)}` : ""} Change the next action to address this evidence, then rerun the directly relevant check and stop when it passes or produces a new specific diagnosis.`;
 	return {
 		assessment,
 		apply: result.action === "strong" ? "block" : result.action === "soft" ? "continue" : "none",
@@ -311,4 +324,16 @@ export function decideCorrectionAssessment(assessment: Assessment, snapshot: Evi
 		memo,
 		focusKey,
 	};
+}
+
+export function decideTunedCompletion(assessment: Assessment, snapshot: EvidenceSnapshot, config: SupervisorConfig, flags: { budgetAvailable?: boolean; packet?: AssessmentPacket } = {}): Decision {
+	const status = assessment.answers.completion_status;
+	if (!assessment.ok || status?.type !== "choice") return { assessment, apply: "none", status: "UNCHECKED", reasons: ["completion assessment unavailable"], memo: null, focusKey: null };
+	if (status.choice === "SUPPORTED" && !assessment.partialCoverage && !snapshot.truncated) return { assessment, apply: "none", status: "COMPLETE", reasons: ["completion_status=SUPPORTED with complete local representation"], memo: null, focusKey: null };
+	if (status.choice !== "CONTRADICTED") return { assessment, apply: "none", status: "UNRESOLVED", reasons: ["completion_status=NOT_ESTABLISHED; completion is not certified"], memo: null, focusKey: null };
+	const correction = decideCorrectionAssessment(assessment, snapshot, config, flags);
+	if (correction.apply === "block") correction.apply = "continue";
+	correction.status = correction.apply === "continue" ? "REPLAN" : "UNRESOLVED";
+	correction.reasons.unshift("completion_status=CONTRADICTED");
+	return correction;
 }

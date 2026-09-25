@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildAssessmentPacket, buildCorrectionQuestions, evaluateCorrectionPolicy, LifecycleTracker, shouldScheduleCheckpoint, type EvidenceLedger } from "../src/supervisor-tuning.ts";
+import { buildAssessmentPacket, buildCompletionQuestions, buildCorrectionQuestions, evaluateCorrectionPolicy, LifecycleTracker, shouldScheduleCheckpoint, type EvidenceLedger } from "../src/supervisor-tuning.ts";
 
 function ledger(extra = ""): EvidenceLedger {
 	return {
@@ -43,6 +43,13 @@ test("questions stay intact and expose every retained neutral source id", () => 
 	const anchor = questions[2]!;
 	assert.ok("e1" in anchor.criteria);
 	assert.match(questions[0]!.instructions, /INSUFFICIENT_EVIDENCE/);
+});
+
+test("completion distinguishes contradicted from not established", () => {
+	const packet = buildAssessmentPacket(ledger(), { selector: "s2", softPayloadBytes: 4096, assessmentScope: { kind: "completion", targetId: "p1" } }).packet;
+	const question = buildCompletionQuestions(packet)[0]!;
+	assert.equal(question.id, "completion_status");
+	assert.deepEqual(Object.keys(question.criteria), ["SUPPORTED", "CONTRADICTED", "NOT_ESTABLISHED"]);
 });
 
 test("strong action requires supported grounding and a qualifying concern", () => {

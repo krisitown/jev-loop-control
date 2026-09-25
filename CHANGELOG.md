@@ -5,6 +5,17 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
+## 0.4.0-dev.2 - 2026-09-26
+
+- Extends the opt-in path to completion assessments with explicit SUPPORTED,
+  CONTRADICTED, and NOT_ESTABLISHED outcomes.
+- Policy now evaluates exactly the packet sent on the wire, includes structured
+  tool arguments in the protected proposal, and emits evidence-linked guidance
+  with an observable verification exit check.
+- Soft advice is queued separately from delivery; strong blocks trace delivery.
+- Development checkpoint only. Raw evidence recovery and real actor validation
+  remain outstanding.
+
 ## 0.4.0-dev.1 - 2026-09-26
 
 - Adds an opt-in correction-diagnosis path with S1/S2 evidence packet selection,
