@@ -77,6 +77,11 @@ function fakeClient(script: { direction: Array<"VERIFY" | "PROCEED"> }, sent: Ru
 				else if (question.role === "focus_requirement") {
 					selected = question.criteria.R1 === undefined ? "NONE" : "R1";
 				}
+				else if (question.role === "correction_needed") selected = "NO_CORRECTION_JUSTIFIED";
+				else if (question.role === "primary_concern") selected = "NONE";
+				else if (question.role === "evidence_anchor" || question.role === "requirement_focus") selected = "NONE";
+				else if (question.role === "completion_status") selected = "SUPPORTED";
+				else if (question.role === "concern_outcome") selected = "UNKNOWN";
 				answers[question.id] = {
 					type: "choice",
 					questionId: question.id,
@@ -157,6 +162,7 @@ async function runFixture(
 		direction: Array<"VERIFY" | "PROCEED">;
 		prompts: string[];
 		script?: FixtureOptions["script"];
+		tuning?: Record<string, unknown>;
 	},
 ): Promise<RunResult> {
 	const supervisorDir = mkdtempSync(join(tmpdir(), "jev-live-config-"));
@@ -171,6 +177,7 @@ async function runFixture(
 		budget: { maxRequests: 50 },
 		policy: { probabilityThreshold: 0.8, gapThreshold: 0.2, repeatDiagnosticThreshold: 0.85 },
 		limits: { maxTerminalContinuations: 2, ...(options.limits ?? {}) },
+		...(options.tuning ? { tuning: options.tuning } : {}),
 		trace: { dir: traceDir, artifacts: false },
 	}));
 
@@ -254,6 +261,29 @@ async function runFixture(
 
 	return { fixture, probe, sent, events: readJsonLines(join(runDir, "events.jsonl")), summary };
 }
+
+test("tuned adapter preserves large Unicode proposal units and complete question instructions", async (t) => {
+	const marker = "КРАЕН_Ω_🧪_中間";
+	const large = `${"а".repeat(9000)}${marker}${"β".repeat(9000)}`;
+	const run = await runFixture(t, {
+		mode: "observe",
+		direction: ["PROCEED"],
+		prompts: ["Preserve the exact Unicode marker while writing the requested file."],
+		tuning: { enabled: true, selector: "s2", softPayloadBytes: 32768, proposalEvery: 1, completionEnabled: true, cooldownCheckpoints: 0 },
+		script: [
+			fauxAssistantMessage([fauxToolCall("write_toy", { path: "unicode.txt", text: large }, { id: "call-unicode" })]),
+			fauxAssistantMessage("Completed the requested write."),
+		],
+	});
+	const direction = run.sent.find((item) => item.kind === "direction");
+	assert.ok(direction, "tuned direction assessment dispatched through the production adapter");
+	const state = direction.state as { current_proposal?: { text?: string }; coverage?: { local?: string } };
+	assert.match(state.current_proposal?.text ?? "", new RegExp(marker));
+	assert.equal(state.coverage?.local, "sufficient");
+	assert.deepEqual(direction.questions.slice(0, 4).map((question) => question.id), ["correction_needed", "primary_concern", "evidence_anchor", "requirement_focus"]);
+	assert.match(direction.questions[0]?.instructions ?? "", /INSUFFICIENT_EVIDENCE/);
+	assert.equal(run.fixture.executed.includes("write_toy"), true, "productive proposal remains unblocked");
+});
 
 function fixtureNetworkClean(fixture: { networkAttempts: string[] }): boolean {
 	return fixture.networkAttempts.length === 0;

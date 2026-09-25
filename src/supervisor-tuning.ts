@@ -162,7 +162,7 @@ export function buildAssessmentPacket(ledger: EvidenceLedger, options: PacketBui
 		packet.coverage.omitted_ids.push(unit.id);
 	}
 	packet.coverage.global = ledger.globalCoverageVerified === true && packet.coverage.omitted_ids.length === 0 ? "complete" : packet.coverage.omitted_ids.length > 0 ? "partial" : "unknown";
-	if (!target || (packet.applicable_requirements.length === 0 && packet.recent_evidence.length === 0)) packet.coverage.local = "insufficient";
+	if (!target) packet.coverage.local = "insufficient";
 	// Selection metadata itself consumes wire bytes. Remove only optional complete
 	// units until the final serialized packet fits; protected units remain whole.
 	for (const field of ["trajectory", "open_concerns", "recent_evidence", "applicable_requirements"] as const) {

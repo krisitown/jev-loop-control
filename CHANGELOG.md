@@ -5,6 +5,12 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
+## 0.4.0-dev.6 - 2026-09-26
+
+- Adds a production-adapter regression proving an 18K-character Unicode tool
+  argument remains intact through tuned packet construction, complete correction
+  instructions reach the transport, and productive work remains unblocked.
+
 ## 0.4.0-dev.5 - 2026-09-26
 
 - Scopes issue identity to the session branch, preserves explicit unresolved and
