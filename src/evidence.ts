@@ -20,6 +20,12 @@
  */
 
 import { capText, ELISION_MARK, hashJson, redactText, removeLiteral } from "./redact.ts";
+import {
+	parseVerification,
+	selectVerificationChecks,
+	verificationCheckEntry,
+	type VerificationCheckEntry,
+} from "./verification.ts";
 import type {
 	DeterministicFact,
 	EvidenceSnapshot,
@@ -418,6 +424,13 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 		}
 	}
 	const observationsAll: SnapshotObservation[] = [];
+	// The ORIGINAL command and raw output of each executed bash call, so a
+	// verification trailer is recognized before any truncation or redaction can
+	// hide it. Parsed only for calls the executed-tool hook proved.
+	const rawBashById = new Map<string, { command: string; text: string }>();
+	// Evidence id -> the RAW command of that call, keyed by evidence id so the
+	// rendered check records never need a lookup by (redacted) tool-call id.
+	const rawCommandById = new Map<string, string>();
 	// Truncation metadata is recorded AT CREATION, keyed by the observation's own
 	// evidence id, and computed from the raw text of THAT message. Looking a result
 	// up later by its (redacted) tool-call id would compare a sanitized id against
@@ -433,9 +446,20 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 		}
 		const rawCallId = typeof message.toolCallId === "string" ? message.toolCallId : "";
 		const didExecute = rawCallId !== "" && input.executedToolCallIds.has(rawCallId);
+		const rawToolName = typeof message.toolName === "string" ? message.toolName : (callsById.get(rawCallId)?.name ?? "");
 		const toolCallId = scrub(rawCallId);
 		const found = callsById.get(rawCallId);
 		const id = `E${observationsAll.length + 1}`;
+		// Verification candidates need the RAW command of this call, so the parse
+		// runs on the original command line, never a redacted view.
+		if (didExecute && rawToolName === "bash") {
+			const rawArgs = found?.arguments;
+			const rawCommand = isRecord(rawArgs) && typeof rawArgs.command === "string" ? rawArgs.command : "";
+			if (rawCommand) {
+				rawBashById.set(rawCallId, { command: rawCommand, text: visibleText(message) });
+				rawCommandById.set(id, rawCommand);
+			}
+		}
 		if (found) {
 			const rendered = JSON.stringify(found.arguments);
 			const bounded = capTo(rendered, OBSERVATION_ARGS_CHARS);
@@ -462,6 +486,16 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 			// marker text), so cap content at `budget - markerOverhead(budget)` to make
 			// the retained text exactly `OBSERVATION_TEXT_CHARS`.
 			text: capped.text,
+			// The check outcome of this call's own output, when it ran Python unittest.
+			...(didExecute && rawBashById.has(rawCallId)
+				? (() => {
+					const raw = rawBashById.get(rawCallId)!;
+					const outcome = parseVerification("bash", raw.command, { text: raw.text, executed: true });
+					return outcome && "record" in outcome
+						? { verification: { ...outcome.record, summary: scrub(outcome.record.summary) } }
+						: {};
+				})()
+				: {}),
 			...(found ? { arguments: boundedArgsById.get(id)!.value, argsHash: found.argsHash } : {}),
 		});
 	}
@@ -471,10 +505,10 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 	// omitted observation is still reported under its original id.
 	const lastWindowStart = Math.max(0, observationsAll.length - RECENT_RESULTS);
 	const lastIds = new Set(observationsAll.slice(lastWindowStart).map((observation) => observation.id));
-	const olderErrors = observationsAll.filter((observation, index) => index < lastWindowStart && !observation.ok).slice(-ERROR_HISTORY);
+	const olderProblems = observationsAll.filter((observation, index) => index < lastWindowStart && (!observation.ok || observation.verification?.outcome === "failed")).slice(-ERROR_HISTORY);
 	const keptPositions = new Set<number>([
 		...observationsAll.slice(lastWindowStart).map((observation) => observationsAll.indexOf(observation)),
-		...olderErrors.map((observation) => observationsAll.indexOf(observation)),
+		...olderProblems.map((observation) => observationsAll.indexOf(observation)),
 	]);
 	const retained = observationsAll.filter((_, index) => keptPositions.has(index));
 	const omittedObservationIds = observationsAll.filter((_, index) => !keptPositions.has(index)).map((observation) => observation.id);
@@ -487,6 +521,22 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 		.slice(-RECENT_ACTIONS_WINDOW)
 		.filter((observation) => boundedArgsById.get(observation.id)?.truncated === true)
 		.length;
+
+	const verificationChecks: VerificationCheckEntry[] = selectVerificationChecks(
+		observationsAll
+			.filter((observation) => observation.provenance === "executed" && observation.verification !== undefined)
+			.map((observation) => {
+				return verificationCheckEntry({
+					evidenceId: observation.id,
+					toolCallId: observation.toolCallId,
+					command: scrub(rawCommandById.get(observation.id) ?? ""),
+					commandChars: OBSERVATION_ARGS_CHARS,
+					argsHash: observation.argsHash ?? "",
+					record: observation.verification!,
+					source: `pi:${observation.toolName}:tool_result(executed)`,
+				});
+			}),
+	);
 
 	const proposalText = scrub(visibleText(input.target));
 	// History excludes the candidate itself: `final_answer` must be the current
@@ -541,7 +591,18 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 				return {
 					tool: observation.toolName,
 					tool_call_id: observation.toolCallId,
-					result: observation.ok ? "success" : "error",
+					// Tool STATUS, not a check outcome: `success` used to be read as
+					// "the tests passed", which a piped unittest run proved false.
+					result: observation.ok ? "tool_completed" : "tool_error",
+					// An explicit reported check outcome, whenever the tool's own
+					// output carried a recognizable unittest trailer.
+					...(observation.verification
+						? {
+							test_outcome: observation.verification.outcome,
+							tests_run: observation.verification.testsRun,
+							test_basis: observation.verification.basis,
+						}
+						: {}),
 					executed: observation.provenance === "executed",
 					evidence_id: observation.id,
 					...(observation.arguments !== undefined
@@ -558,6 +619,9 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 		facts: facts.slice(-FACTS_WINDOW),
 		facts_omitted_count: Math.max(0, facts.length - FACTS_WINDOW),
 		prior_interventions: priorInterventions,
+		// Latest reported check outcomes (max 4, newest of each exact command).
+		// A bounded summary in this snapshot, never a persistent ledger.
+		verification_checks: verificationChecks,
 		omitted_evidence_ids: omittedObservationIds,
 		omitted_observation_count: omittedObservationIds.length,
 		context_selection: {

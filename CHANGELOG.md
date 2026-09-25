@@ -5,6 +5,20 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
+## 0.3.3 - Candidate
+
+Patch on top of 0.3.2.
+
+### Changed
+
+- Bounded verification context: Python unittest summaries from executed bash output are reported separately from tool completion; a pipeline exit 0 no longer appears as test success.
+- Recent result retention updated to last 12 plus up to TWO total older problematic observations (tool errors OR failed verifications).
+- Questions now distinguish a concrete local correction (EXECUTE) from approach redesign (REPLAN), compare proposed behavior with user requirements, and allow legitimate corrections of actor-authored tests.
+
+### Testing
+
+Relevant tests updated to reflect verification context changes and retention logic. Independent validation is pending and will be completed before release.
+
 ## 0.3.2 - 2026-09-25
 
 Patch on top of 0.3.1.

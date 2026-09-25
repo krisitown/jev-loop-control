@@ -4,7 +4,7 @@ Pi extension that supervises actor direction and completion with bounded Jev ass
 
 Jev checks the actor's proposed tools and completion status, applying bounded interventions when necessary. It works alongside the actor model you already use in Pi: **your configured Pi model stays the actor.** This version does not change that.
 
-**Version:** 0.3.2 · See [CHANGELOG.md](CHANGELOG.md).
+**Version:** 0.3.3 · See [CHANGELOG.md](CHANGELOG.md).
 
 Jev supervises and, in `enforce`, redirects work that its evidence does not support. Whether that improves your outcomes is yours to measure: this project makes no proven-effectiveness claim, and traces plus statuses are written so you can check each decision yourself.
 
@@ -34,7 +34,7 @@ pi update git:github.com/krisitown/jev-loop-control
 
 To pin to this release:
 ```bash
-pi install git:github.com/krisitown/jev-loop-control@v0.3.2
+pi install git:github.com/krisitown/jev-loop-control@v0.3.3
 ```
 
 *Note: This package is not available on npm. Do not use `npm install jev-loop-control`.*
@@ -162,7 +162,8 @@ Each assessment carries a **bounded view of the task trajectory**, not the whole
 - Task requirements and their origin (from the manifest, or the original request).
 - The single proposal under review: terminal text or proposed tool calls with their argument hashes.
 - Conversation history capped at `limits.maxEvidenceChars` (default 12000), excluding the candidate text itself.
-- Recent tool results: the **last 12** observations, plus the **2 most recent errors** that fall outside that window, so an old failure is not silently forgotten.
+- Bounded verification context: Python unittest summaries from executed bash output are reported separately from tool completion; a pipeline exit 0 no longer appears as test success. Latest four recognized checks are retained by exact command; older failures remain history, with no claim that a different suite supersedes them. Unsupported formats remain raw evidence, not guessed passing results.
+- Recent tool results: the **last 12** observations, plus up to **2 total older problematic observations** (tool errors OR failed verifications) that fall outside that window, so an old failure is not silently forgotten.
 - Recent actions: the last 24 actions with success/error status, whether they actually executed, and arguments capped at 600 characters plus a hash.
 - Deterministic facts: the last 24, with an omitted count.
 - The last 5 prior interventions, `omitted_evidence_ids`, and `context_selection` truncation metadata.
@@ -171,7 +172,7 @@ Each assessment carries a **bounded view of the task trajectory**, not the whole
 
 ## Interventions and Recovery Guidance
 
-In `enforce`, a direction block opens a recovery: a mode (`RESEARCH`, `REPLAN`, `VERIFY`, `EXECUTE`) and an objective taken from the assessment memo. The objective is delivered as a hidden guidance message and stays attached for `limits.proposalLease` proposals (default **2**), then expires. **Expiry does not mean the objective was met.**
+In `enforce`, a direction block opens a recovery: a mode (`RESEARCH`, `REPLAN`, `VERIFY`, `EXECUTE`) and an objective taken from the assessment memo. Questions now distinguish a concrete local correction (`EXECUTE`) from approach redesign (`REPLAN`), compare proposed behavior with user requirements, and allow legitimate corrections of actor-authored tests. The objective is delivered as a hidden guidance message and stays attached for `limits.proposalLease` proposals (default **2**), then expires. **Expiry does not mean the objective was met.**
 
 - **Duplicate suppression:** a recovery for the same focus and the same recent evidence is not reopened. The repeat is traced as `intervention.suppressed` instead of re-issuing the same advice.
 - **Repeats at completion:** the same unfinished focus with no new evidence stops instead of looping.
@@ -205,7 +206,7 @@ Status values:
 - **UNCHECKED**: Assessment unavailable or skipped; not a success verdict.
 - **COMPLETE**: All requirements strongly supported and final claims supported.
 
-Failed or weak assessments do not cause intervention. HTTP requests retry 503 once after 500ms within the deadline; other failures are not retried. Request/assessment limits apply per session; intervention limits per task.
+Failed or weak assessments do not cause intervention. HTTP requests retry 503 once after 500ms within the deadline; other failures are not retried. Request/assessment limits apply per session; intervention limits per task. Thresholds, no-budget defaults, and one 503 retry unchanged.
 
 ## Task Manifest
 
@@ -259,6 +260,7 @@ Tests use synthetic data and do not require paid credentials.
 - Gateway cost fields may remain unknown; reservations are kept in these cases.
 - This is a supervisor, not a security boundary.
 - Completion continuation exercised with real Pi; tool-batch blocking covered by synthetic checks.
+- This product does not detect every bug or handle arbitrary test frameworks.
 
 ## License
 

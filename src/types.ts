@@ -10,6 +10,7 @@
  */
 
 import type { SupervisorConfig } from "./config.ts";
+import type { VerificationRecord } from "./verification.ts";
 
 export type Mode = SupervisorConfig["mode"];
 
@@ -197,6 +198,13 @@ export interface SnapshotObservation {
 	ok: boolean;
 	provenance: ToolProvenance;
 	text: string;
+	/**
+	 * What a reported check in this tool's OWN output said, when the tool ran a
+	 * recognizable check (see verification.ts). This is a check outcome, not tool
+	 * status and never proof that an arbitrary implementation is correct; `ok`
+	 * stays exactly the tool's own error flag. Absent when no check was observed.
+	 */
+	verification?: VerificationRecord;
 	/**
 	 * Complete sanitized arguments of the finalized call, when it was found.
 	 * The snapshot keeps them complete; the rendered `recent_actions` window may
