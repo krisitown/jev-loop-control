@@ -4,7 +4,8 @@ Pi extension that supervises actor direction and completion with bounded Jev ass
 
 Jev checks the actor's proposed tools and completion status, applying bounded interventions when necessary. It works alongside the actor model you already use in Pi: **your configured Pi model stays the actor.** This version does not change that.
 
-**Version:** 0.3.4 · See [CHANGELOG.md](CHANGELOG.md).
+**Version:** 0.3.5 · See [CHANGELOG.md](CHANGELOG.md).
+
 
 Jev supervises and, in `enforce`, redirects work that its evidence does not support. Whether that improves your outcomes is yours to measure: this project makes no proven-effectiveness claim, and traces plus statuses are written so you can check each decision yourself.
 
@@ -34,7 +35,8 @@ pi update git:github.com/krisitown/jev-loop-control
 
 To pin to this release:
 ```bash
-pi install git:github.com/krisitown/jev-loop-control@v0.3.4
+pi install git:github.com/krisitown/jev-loop-control@v0.3.5
+
 ```
 
 *Note: This package is not available on npm. Do not use `npm install jev-loop-control`.*
@@ -129,7 +131,9 @@ Your configured Pi model remains the actor. A bounded snapshot of the task traje
 
 ### Request Size Guard
 
-`jev.maxRequestBytes` (default `131072`) is a **local** ceiling on what this client will put on the wire. It is not an assertion about any provider's own limit, and raising it buys no extra provider allowance. The guard additionally estimates `ceil(UTF8bytes/2)`: `state + longestQuestion <= 16000` tokens, `total <= 32000` tokens. These are estimates, not an exact tokenizer. A mandatory oversize packet is retained but skipped as `UNCHECKED`. Lower it if you want smaller outbound requests, raise it only if you have confirmed your endpoint accepts them.
+`jev.maxRequestBytes` (default `131072`) is a **local** ceiling on what this client will put on the wire. It is not an assertion about any provider's own limit, and raising it buys no extra provider allowance. The guard additionally estimates `ceil(UTF8bytes/2)`: `state + longestQuestion <= 16000` tokens, `total <= 32000` tokens. These are estimates, not an exact tokenizer.
+
+In v0.3.5, oversized packets are compacted from already-redacted data rather than skipped. The compact packet retains bounded task/proposal/history/evidence and questions, hashes the original payload, and marks partial coverage in the request and assessment/trace. Omitted context is not evidence of missing work. Partial coverage prevents a full `COMPLETE` clearance but alone does not force `VERIFY` or suppress explicit supported steering. Dispatch may still be prevented by missing auth, cancellation, budgets, or impossibly small configured `maxRequestBytes`.
 
 ### HTTP 503 Retry
 

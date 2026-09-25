@@ -417,6 +417,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 				actualApply: "none",
 				proposalId: s.proposalId,
 				contextSelection: snapshot.representation.context_selection,
+				partialCoverage: a.partialCoverage ?? false,
 			});
 			return decision;
 		}).catch((e) => {
@@ -547,6 +548,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 						actualApply: "none",
 						proposalId: s.proposalId,
 						contextSelection: snapshot.representation.context_selection,
+						partialCoverage: a.partialCoverage ?? false,
 					});
 					if (state !== s || s.epoch !== epoch) return;
 					s.finalStatus = decision.status;

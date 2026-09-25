@@ -203,6 +203,9 @@ export function decideCompletion(input: CompletionPolicyInput): Decision {
 	if (snapshot.truncated) {
 		reasons.push("the evidence sent was bounded; a complete verdict is not claimable from truncated evidence");
 	}
+	if (assessment.partialCoverage) {
+		reasons.push("partial coverage from live compact fallback; a complete verdict is not claimable from partial context");
+	}
 	const contradictions = snapshot.facts.filter((fact) => fact.kind === "truncation" || fact.kind === "error" || fact.kind === "aborted");
 	for (const fact of contradictions) {
 		reasons.push(`deterministic fact contradicts completion: ${fact.kind} on ${fact.subject} (${fact.value})`);
@@ -244,7 +247,7 @@ export function decideCompletion(input: CompletionPolicyInput): Decision {
 
 	const allMet = unmet.length === 0 && requirementAnswers.every((entry) => entry.margin?.selected === "MET");
 	const completeSelected = nextStep?.selected === "COMPLETE";
-	if (allMet && !claimsUnsupported && completeSelected && strongEnough(nextStep, config) && contradictions.length === 0 && !snapshot.truncated) {
+	if (allMet && !claimsUnsupported && completeSelected && strongEnough(nextStep, config) && contradictions.length === 0 && !snapshot.truncated && !assessment.partialCoverage) {
 		return {
 			assessment,
 			apply: "none",

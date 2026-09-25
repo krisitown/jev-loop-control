@@ -5,7 +5,23 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
+## 0.3.5 - 2026-09-25
+
+### Changed
+- Default oversized assessments now compact already-redacted state/questions into bounded packets before dispatch.
+- Actual wire body and hash are recorded as trace artifacts.
+- Explicit partial coverage blocks a full COMPLETE clearance but does not by itself force VERIFY or suppress supported negative steering.
+- Auth, cancel, budget, and 503 behavior remain unchanged.
+
+### Testing
+- TypeScript validation passed.
+- 209 local tests passed.
+
+- External fallback: 8/8 cases.
+- Live real gateway: 5/5 cases with packet sizes 8.8–10.3 KB and 1 request per case, except one oversized-input case which used 2 attempts.
+
 ## 0.3.4 - 2026-09-25
+
 
 ### Changed
 

@@ -282,17 +282,27 @@ test("client: validation failure messages are scrubbed of the configured key", a
 	assert.equal(assessment.failure?.stage, "validation");
 });
 
-test("client: zero requests and zero attempts when the key is missing or the request is oversized", async () => {
+test("client: zero requests on missing key; one clipped dispatch on oversized proposal", async () => {
 	let calls = 0;
 	const fetchImpl = (async () => { calls += 1; return responseOf({}); }) as unknown as typeof fetch;
+
+	// Missing key: zero dispatch
 	const noKey = createHttpClient({ endpoint: "https://x.test", model: "m", apiKeyEnv: "ABSENT_KEY", deadlineMs: 1000, maxRequestBytes: 1000, maxResponseBytes: 1000, env: {}, fetchImpl });
 	const a1 = await noKey.assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state: {}, signal: undefined, deadlineMs: 1000 });
 	assert.ok(!a1.ok && a1.usage.attempts === 0 && calls === 0);
 
-	const tiny = createHttpClient({ endpoint: "https://x.test", model: "m", apiKeyEnv: "TEST_JEV_KEY", deadlineMs: 1000, maxRequestBytes: 1024, maxResponseBytes: 1000, env: { TEST_JEV_KEY: "k" }, fetchImpl });
-	const a2 = await tiny.assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state: { huge: "y".repeat(4000) }, signal: undefined, deadlineMs: 1000 });
-	assert.ok(!a2.ok && a2.usage.attempts === 0 && calls === 0, "an oversized request is never dispatched");
-	assert.equal(a2.usage.requestBytes > 1024, true);
+	// Oversized proposal: one clipped dispatch
+	const tiny = createHttpClient({ endpoint: "https://x.test", model: "m", apiKeyEnv: "TEST_JEV_KEY", deadlineMs: 1000, maxRequestBytes: 4096, maxResponseBytes: 1000, env: { TEST_JEV_KEY: "k" }, fetchImpl });
+	const state = { proposal: { tool_calls: [{ name: "test_tool", arguments: { data: "y".repeat(12000) } }] } };
+	const a2 = await tiny.assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state, signal: undefined, deadlineMs: 1000 });
+
+	assert.equal(calls, 1, "fallback dispatched exactly once");
+	assert.ok(!a2.ok && a2.usage.attempts === 1 && a2.partialCoverage === true);
+	assert.ok(a2.usage.requestBytes <= 4096);
+	assert.ok(a2.requestBody);
+	const parsed = JSON.parse(a2.requestBody);
+	assert.strictEqual(parsed.state._fallback.partial_coverage, true);
+	assert.strictEqual(parsed.state._fallback.proposal_clipped, true);
 });
 
 // ---------------------------------------------------------------- 503 retry

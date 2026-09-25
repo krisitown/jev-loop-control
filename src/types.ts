@@ -152,6 +152,13 @@ export interface Assessment {
 	responseBody?: string;
 	/** Never guessed: `live` only for a real HTTP exchange. */
 	origin: "live" | "synthetic" | "none";
+	/**
+	 * True when the live compact fallback carried partial context. This flag
+	 * prevents COMPLETE even when snapshot.truncated is false and all
+	 * requirements are MET, but does not affect assessment.ok or return
+	 * UNCHECKED solely due to partial coverage.
+	 */
+	partialCoverage?: boolean;
 }
 
 export interface Requirement {
@@ -220,7 +227,8 @@ export interface EvidenceSnapshot {
 	task: { manifest: boolean; requirements: Requirement[]; origin: string };
 	/** Bounded actor text; `truncated` says whether it was bounded. */
 	actorText: string;
-	/** Complete, untruncated proposal text. A proposal too large to send is skipped, not trimmed. */
+/** Full immutable snapshot; compaction applies only to the optional wire form. */
+
 	proposalText: string;
 	toolCalls: SnapshotToolCall[];
 	observations: SnapshotObservation[];

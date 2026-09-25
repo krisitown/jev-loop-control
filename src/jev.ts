@@ -26,6 +26,16 @@ import { randomUUID } from "node:crypto";
 import { hashBytes, redactText, removeLiteral } from "./redact.ts";
 import { optionIds, type Answer, type Assessment, type AssessmentKind, type CostInfo, type EvidenceSnapshot, type JevClient, type Question } from "./types.ts";
 
+/** Conservative ceiling for the compact fallback packet (comfortably below 49152). */
+/** Max characters kept from any single string field in the fallback packet. */
+const FALLBACK_STRING_CLIP = 2000;
+/** Max items kept from any single array in the fallback packet. */
+const FALLBACK_ARRAY_CLIP = 20;
+/** Max requirement questions retained in a completion fallback. */
+const FALLBACK_COMPLETION_REQ_MAX = 8;
+/** Max IDs sampled in the omitted-ID summary. */
+const FALLBACK_OMITTED_SAMPLE = 10;
+
 export const PROBABILITY_SUM_TOLERANCE = 0.02;
 export const SELECTED_PROBABILITY_TOLERANCE = 1e-6;
 
@@ -122,6 +132,380 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** Deterministic generic JSON/string clipping with hashes. No language-specific parsing. */
+function clipValue(value: unknown, depth: number = 0, maxChars: number = FALLBACK_STRING_CLIP): unknown {
+	if (depth > 6) return "[depth-clipped]";
+	if (typeof value === "string") {
+		const chars = Array.from(value);
+		if (chars.length <= maxChars) return value;
+		const half = Math.floor(maxChars / 2);
+		const head = chars.slice(0, half).join("");
+		const tail = chars.slice(-half).join("");
+		const hash = hashBytes(Buffer.from(value, "utf8"));
+		return `${head}...[clipped:${hash}]...${tail}`;
+	}
+	if (Array.isArray(value)) {
+		if (value.length <= FALLBACK_ARRAY_CLIP) return value.map((v) => clipValue(v, depth + 1, maxChars));
+		const head = value.slice(0, FALLBACK_ARRAY_CLIP / 2).map((v) => clipValue(v, depth + 1, maxChars));
+		const tail = value.slice(-FALLBACK_ARRAY_CLIP / 2).map((v) => clipValue(v, depth + 1, maxChars));
+		const hash = hashBytes(Buffer.from(JSON.stringify(value), "utf8"));
+		return [...head, `[array-clipped:${hash}]`, ...tail];
+	}
+	if (isRecord(value)) {
+		const out: Record<string, unknown> = {};
+		for (const [k, v] of Object.entries(value)) {
+			out[k] = clipValue(v, depth + 1, maxChars);
+		}
+		return out;
+	}
+	return value;
+}
+/** Clone a question, clipping strings per type. */
+function cloneQuestion(q: Question, clip: (s: string) => string): Question {
+	if (q.type === "choice") {
+		return {
+			...q,
+			instructions: clip(q.instructions),
+			criteria: Object.fromEntries(Object.entries(q.criteria).map(([k, v]) => [k, clip(v)])),
+		};
+	}
+	// noul: map true/false explicitly, clip strings
+	return {
+		...q,
+		instructions: clip(q.instructions),
+		criteria: { true: clip(q.criteria.true), false: clip(q.criteria.false) },
+	};
+}
+
+function buildFallbackPacket(
+	kind: AssessmentKind,
+	state: Record<string, unknown>,
+	questions: readonly Question[],
+	scrub: (text: string) => string,
+	model: string,
+	maxRequestBytes: number,
+): { state: Record<string, unknown>; questions: Question[]; built: RequestBuild } | null {
+	const originalStateHash = hashBytes(Buffer.from(JSON.stringify(state), "utf8"));
+	const originalQuestionsHash = hashBytes(Buffer.from(JSON.stringify(questions), "utf8"));
+	const originalStateBytes = Buffer.byteLength(JSON.stringify(state), "utf8");
+const originalQuestionsBytes = Buffer.byteLength(JSON.stringify(questions), "utf8");
+	const originalRequestHash = hashBytes(buildRequestBody({ model, state, questions }, scrub).body);
+
+	const budgets = [
+		{ reqMax: 8, arrClip: 4, strClip: 500 },
+		{ reqMax: 4, arrClip: 2, strClip: 200 },
+		{ reqMax: 2, arrClip: 1, strClip: 100 },
+	];
+
+	for (const budget of budgets) {
+		const clip = (value: unknown) => clipValue(value, 0, budget.strClip);
+		const compactState: Record<string, unknown> = {};
+		const evidence: Record<string, unknown> = {};
+		const omittedReqIds: string[] = [];
+		const omittedQIds: string[] = [];
+
+		// Task Requirements
+		if (isRecord(state.task) && Array.isArray((state.task as Record<string, unknown>).requirements)) {
+			const reqs = (state.task as Record<string, unknown>).requirements as unknown[];
+			const keptReqs: unknown[] = [];
+			if (reqs.length <= budget.reqMax) {
+				keptReqs.push(...reqs);
+			} else {
+				const half = Math.floor(budget.reqMax / 2);
+				keptReqs.push(...reqs.slice(0, half));
+				keptReqs.push(...reqs.slice(-half));
+				for (let i = half; i < reqs.length - half; i++) {
+					const r = reqs[i];
+					if (isRecord(r) && typeof r.id === "string") omittedReqIds.push(r.id);
+				}
+			}
+			evidence.task_requirements = keptReqs.map((r) => clip(r));
+		}
+
+const ahRaw = isRecord(state.evidence) ? state.evidence.actor_history : undefined;
+		let historyClipped = false;
+		if (isRecord(ahRaw) && typeof ahRaw.text === "string") {
+			const rawText = ahRaw.text;
+			const originalChars = Array.from(rawText).length;
+
+			// Split into blocks separated by blank lines
+const rawBlocks = rawText.split(/\n\s*\n(?=\s*(?:\[user\]:|\[assistant\]:|\[toolResult\]:))/);
+			const blocks: string[] = [];
+			for (const b of rawBlocks) {
+				const trimmed = b.trim();
+				if (trimmed.length > 0) {
+					blocks.push(trimmed);
+				}
+			}
+
+			// Identify user blocks
+			const userIndices: number[] = [];
+			for (let i = 0; i < blocks.length; i++) {
+				const block = blocks[i];
+				if (typeof block === 'string' && (/^\s*\[user\]:/i.test(block) || /^\s*user\s*:/i.test(block))) {
+					userIndices.push(i);
+				}
+			}
+
+			let selectedIndices: number[] = [];
+			if (userIndices.length > 0) {
+				const firstIdx = userIndices[0]!;
+				const lastIdx = userIndices[userIndices.length - 1]!;
+				if (firstIdx === lastIdx) {
+					selectedIndices = [firstIdx];
+				} else {
+					selectedIndices = [firstIdx, lastIdx];
+				}
+			} else {
+				// No user blocks: choose first and latest blocks
+				if (blocks.length === 1) {
+					selectedIndices = [0];
+				} else if (blocks.length > 1) {
+					selectedIndices = [0, blocks.length - 1];
+				}
+			}
+
+			// Clip selected blocks using budget.strClip
+			const clippedBlocks: string[] = [];
+			for (const idx of selectedIndices) {
+				const block = blocks[idx];
+				if (typeof block !== 'string') continue;
+				const clipped = Array.from(block).length <= budget.strClip ? block : (() => { const chars = Array.from(block); const half = Math.floor(budget.strClip / 2); return chars.slice(0, half).join('') + hashBytes(block) + chars.slice(-half).join(''); })();
+				clippedBlocks.push(clipped);
+				if (clipped !== block) {
+					historyClipped = true;
+				}
+			}
+
+			const retainedBlocks = selectedIndices.length;
+			const omittedBlocks = blocks.length - retainedBlocks;
+			const truncated = omittedBlocks > 0 || historyClipped;
+			const joinedText = clippedBlocks.join("\n\n");
+
+			evidence.actor_history = {
+				text: joinedText,
+				truncated: truncated,
+				original_chars: originalChars,
+				retained_blocks: retainedBlocks,
+				omitted_blocks: omittedBlocks
+			};
+		}
+		// Evidence: Arrays
+		if (isRecord(state.evidence)) {
+			const ev = state.evidence as Record<string, unknown>;
+			for (const key of ["observations", "recent_actions", "verification_checks", "deterministic_facts", "prior_interventions"]) {
+				if (Array.isArray(ev[key])) {
+					const arr = ev[key] as unknown[];
+					const kept = arr.slice(-budget.arrClip);
+					evidence[key] = kept.map((v) => clip(v));
+					if (arr.length > budget.arrClip) evidence[`${key}_omitted`] = arr.length - budget.arrClip;
+				}
+			}
+		}
+
+// Proposal
+		let proposalClipped = false;
+		if (isRecord(state.proposal)) {
+			const prop = state.proposal as Record<string, unknown>;
+			if (typeof prop.assistant_text === "string") {
+				const clipped = clip(prop.assistant_text);
+				evidence.proposal_assistant_text = clipped;
+				const wasClipped = JSON.stringify(clipped) !== JSON.stringify(prop.assistant_text);
+				evidence.proposal_assistant_text_clipped = wasClipped;
+				if (wasClipped) proposalClipped = true;
+			}
+			if (typeof prop.final_answer === "string") {
+				const clipped = clip(prop.final_answer);
+				evidence.proposal_final_answer = clipped;
+				if (JSON.stringify(clipped) !== JSON.stringify(prop.final_answer)) proposalClipped = true;
+			}
+			if (Array.isArray(prop.tool_calls)) {
+				const tcs = prop.tool_calls as unknown[];
+				const kept = tcs.slice(0, budget.arrClip);
+				evidence.proposal_tool_calls = kept.map((tc) => {
+					const clipped = clip(tc);
+					if (JSON.stringify(clipped) !== JSON.stringify(tc)) proposalClipped = true;
+					return clipped;
+				});
+				if (tcs.length > budget.arrClip) {
+					evidence.proposal_tool_calls_omitted = tcs.length - budget.arrClip;
+					proposalClipped = true;
+				}
+			}
+		}
+
+		// Controller
+		if (isRecord(state.controller)) {
+			const ctrl = state.controller as Record<string, unknown>;
+			if (ctrl.active_recovery_objective !== undefined) evidence.active_recovery_objective = clip(ctrl.active_recovery_objective);
+			if (Array.isArray(ctrl.previous_interventions)) {
+				const pi = ctrl.previous_interventions as unknown[];
+				evidence.previous_interventions = pi.slice(-budget.arrClip).map((v) => clip(v));
+				if (pi.length > budget.arrClip) evidence.previous_interventions_omitted = pi.length - budget.arrClip;
+			}
+		}
+
+		// Questions
+		const compactQuestions: Question[] = [];
+		if (kind === "direction") {
+			const keepRoles = new Set(["next_step", "unproductive_repeat", "focus_requirement"]);
+			const retainedReqIds = new Set<string>(["NONE", "UNKNOWN"]);
+			if (isRecord(state.task) && Array.isArray((state.task as Record<string, unknown>).requirements)) {
+				const allReqs = (state.task as Record<string, unknown>).requirements as unknown[];
+				const keptReqs: unknown[] = [];
+				if (allReqs.length <= budget.reqMax) {
+					keptReqs.push(...allReqs);
+				} else {
+					const half = Math.floor(budget.reqMax / 2);
+					keptReqs.push(...allReqs.slice(0, half));
+					keptReqs.push(...allReqs.slice(-half));
+				}
+				for (const r of keptReqs) {
+					if (isRecord(r) && typeof r.id === "string") retainedReqIds.add(r.id);
+				}
+			}
+			for (const q of questions) {
+				if (keepRoles.has(q.role)) {
+					if (q.role === "focus_requirement") {
+						const filteredCriteria: Record<string, string> = {};
+						for (const [k, v] of Object.entries(q.criteria)) {
+							if (retainedReqIds.has(k)) filteredCriteria[k] = clip(v) as string;
+						}
+						if (q.type === "choice") {
+							compactQuestions.push({
+								...q,
+								instructions: clip(q.instructions) as string,
+								criteria: filteredCriteria,
+							});
+						} else {
+							compactQuestions.push({
+								...q,
+								instructions: clip(q.instructions) as string,
+								criteria: filteredCriteria,
+							} as Question);
+						}
+					} else {
+						compactQuestions.push(cloneQuestion(q, (s) => clip(s) as string));
+					}
+				} else {
+					omittedQIds.push(q.id);
+				}
+			}
+		} else {
+			const reqQs = questions.filter((q) => q.role === "requirement");
+			const otherQs = questions.filter((q) => q.role !== "requirement");
+			const keptReq: Question[] = [];
+			if (reqQs.length <= budget.reqMax) {
+				keptReq.push(...reqQs);
+			} else {
+				const half = Math.floor(budget.reqMax / 2);
+				keptReq.push(...reqQs.slice(0, half));
+				keptReq.push(...reqQs.slice(-half));
+				for (let i = half; i < reqQs.length - half; i++) omittedQIds.push(reqQs[i]!.id);
+			}
+			for (const q of otherQs) {
+				if (q.role === "final_claims_supported" || q.role === "next_step") keptReq.push(q);
+				else omittedQIds.push(q.id);
+			}
+			for (const q of keptReq) {
+				compactQuestions.push(cloneQuestion(q, (s) => clip(s) as string));
+			}
+		}
+
+		// Metadata
+		const omittedSample = omittedQIds.slice(0, 8);
+		const omittedHash = omittedQIds.length > 0 ? hashBytes(Buffer.from(JSON.stringify(omittedQIds), "utf8")) : "";
+		const reqOmittedSample = omittedReqIds.slice(0, 8);
+		const reqOmittedHash = omittedReqIds.length > 0 ? hashBytes(Buffer.from(JSON.stringify(omittedReqIds), "utf8")) : "";
+
+		compactState._fallback = {
+			partial_coverage: true,
+			notice: "Omitted context is absence of evidence, not proof of missing work. Express uncertainty.",
+original_request_hash: originalRequestHash,
+			original_state_hash: originalStateHash,
+			original_questions_hash: originalQuestionsHash,
+			original_state_bytes: originalStateBytes,
+			original_questions_bytes: originalQuestionsBytes,
+			retained_question_count: compactQuestions.length,
+			omitted_question_count: omittedQIds.length,
+			omitted_id_sample: omittedSample,
+			omitted_ids_hash: omittedHash,
+			retained_requirement_count: (evidence.task_requirements as unknown[])?.length ?? 0,
+			omitted_requirement_count: omittedReqIds.length,
+			omitted_req_id_sample: reqOmittedSample,
+			omitted_req_ids_hash: reqOmittedHash,
+			history_clipped: historyClipped,
+proposal_clipped: proposalClipped,
+
+		};
+
+const finalState: Record<string, unknown> = {
+  _fallback: compactState._fallback,
+  task: {
+    ...(isRecord(state.task) && typeof state.task.id === 'string' && { id: state.task.id }),
+    ...(isRecord(state.task) && typeof state.task.requirements_origin === 'string' && { requirements_origin: state.task.requirements_origin }),
+    ...(isRecord(state.task) && typeof state.task.manifest === 'boolean' && { manifest: state.task.manifest }),
+    ...(evidence.task_requirements !== undefined && { requirements: evidence.task_requirements }),
+  },
+  controller: {
+    ...(isRecord(state.controller) && typeof state.controller.work_mode === 'string' && { work_mode: state.controller.work_mode }),
+    ...(isRecord(state.controller) && typeof state.controller.proposal_number === 'number' && { proposal_number: state.controller.proposal_number }),
+    ...(isRecord(state.controller) && typeof state.controller.interventions_used === 'number' && { interventions_used: state.controller.interventions_used }),
+    ...(isRecord(state.controller) && (typeof state.controller.intervention_limit === 'number' || state.controller.intervention_limit === null) && { intervention_limit: state.controller.intervention_limit }),
+    ...(evidence.previous_interventions !== undefined && { previous_interventions: evidence.previous_interventions }),
+    ...(evidence.active_recovery_objective !== undefined && { active_recovery_objective: evidence.active_recovery_objective }),
+  },
+  evidence: {
+    ...(isRecord(state.evidence) && typeof state.evidence.revision === 'string' && { revision: state.evidence.revision }),
+    ...(isRecord(state.evidence) && isRecord(state.evidence.session) && { session: clip(state.evidence.session) }),
+    ...(evidence.actor_history !== undefined && { actor_history: evidence.actor_history }),
+    ...(evidence.observations !== undefined && { observations: evidence.observations }),
+    ...(evidence.recent_actions !== undefined && { recent_actions: evidence.recent_actions }),
+    ...(evidence.verification_checks !== undefined && { verification_checks: evidence.verification_checks }),
+    ...(evidence.deterministic_facts !== undefined && { deterministic_facts: evidence.deterministic_facts }),
+    ...(evidence.prior_interventions !== undefined && { prior_interventions: evidence.prior_interventions }),
+    ...(evidence.known_external_blockers !== undefined && { known_external_blockers: evidence.known_external_blockers }),
+    ...(isRecord(state.evidence) && typeof state.evidence.omitted_counts === 'object' && state.evidence.omitted_counts !== null && { omitted_counts: state.evidence.omitted_counts }),
+    ...(isRecord(state.evidence) && typeof state.evidence.omitted_samples === 'object' && state.evidence.omitted_samples !== null && { omitted_samples: state.evidence.omitted_samples }),
+    ...(evidence.context_selection !== undefined && { context_selection: evidence.context_selection }),
+    ...(isRecord(state.evidence) && typeof state.evidence.redactions_present === 'boolean' && { redactions_present: state.evidence.redactions_present }),
+  },
+  proposal: {
+    ...(isRecord(state.proposal) && typeof state.proposal.id === 'string' && { id: state.proposal.id }),
+    ...(evidence.proposal_assistant_text !== undefined && { assistant_text: evidence.proposal_assistant_text }),
+    ...(evidence.proposal_final_answer !== undefined && { final_answer: evidence.proposal_final_answer }),
+    ...(evidence.proposal_tool_calls !== undefined && { tool_calls: evidence.proposal_tool_calls }),
+  },
+};
+		const built = buildRequestBody({ model, state: finalState, questions: compactQuestions }, scrub);
+
+		if (!fallbackExceedsLimits(built, maxRequestBytes ?? 24000)) {
+			return { state: finalState, questions: compactQuestions, built };
+		}
+	}
+	return null;
+}
+
+function fallbackExceedsLimits(built: RequestBuild, maxRequestBytes: number): boolean {
+	if (built.bytes > maxRequestBytes) return true;
+	const bodyBytes = Buffer.byteLength(built.body, "utf8");
+	if (Math.ceil(bodyBytes / 2) > 32000) return true;
+	try {
+		const parsed = JSON.parse(built.body);
+		const stateBytes = Buffer.byteLength(JSON.stringify(parsed.state), "utf8");
+		let maxQBytes = 0;
+		if (parsed.questions) {
+			for (const q of Object.values(parsed.questions)) {
+				const len = Buffer.byteLength(JSON.stringify(q), "utf8");
+				if (len > maxQBytes) maxQBytes = len;
+			}
+		}
+		if (Math.ceil((stateBytes + maxQBytes) / 2) > 16000) return true;
+	} catch {
+		return true;
+	}
+	return false;
+}
 export type ValidationResult =
 	| { ok: true; answers: Record<string, Answer>; cost: CostInfo; providerId: string | null }
 	| { ok: false; problems: string[]; cost: CostInfo; providerId: string | null };
@@ -421,7 +805,7 @@ async function readCapped(response: Response, maxBytes: number, signal: AbortSig
 	return { text: new TextDecoder("utf-8", { fatal: false }).decode(merged), bytes, tooLarge };
 }
 
-/** The production client: real HTTP, strict validation, no fallback. */
+/** The production client: real HTTP, strict validation, compact oversize fallback. */
 export function createHttpClient(options: HttpClientOptions): JevClient {
 	const env = options.env ?? process.env;
 	const scrub = (text: string): string => removeLiteral(redactText(text), options.secrets ?? []);
@@ -468,7 +852,10 @@ export function createHttpClient(options: HttpClientOptions): JevClient {
 				const responseBody = scrub(outcome.responseText);
 				return { responseBody, responseHash: hashBytes(responseBody) };
 			};
-			if (built.bytes > options.maxRequestBytes || (() => {
+
+			// Determine if the original request exceeds limits.
+			const originalExceedsConfigured = built.bytes > options.maxRequestBytes;
+			const originalExceedsConservative = (() => {
 				const parsed = JSON.parse(requestBody);
 				const bodyBytes = Buffer.byteLength(requestBody, 'utf8');
 				const stateBytes = Buffer.byteLength(JSON.stringify(parsed.state), 'utf8');
@@ -480,27 +867,54 @@ export function createHttpClient(options: HttpClientOptions): JevClient {
 				const estTotal = Math.ceil(bodyBytes / 2);
 				const estStateLongest = Math.ceil((stateBytes + maxQBytes) / 2);
 				return estTotal > 32000 || estStateLongest > 16000;
-			})()) {
-				const isConfiguredByteCap = built.bytes > options.maxRequestBytes;
-				const msg = isConfiguredByteCap
-					? `request is ${built.bytes} bytes, above the configured limit of ${options.maxRequestBytes}`
-					: 'estimated context bounds exceeded: 16000 state+longest question, 32000 total, approximate UTF8/2 method';
-				return finish({
-					ok: false,
-					status: "UNCHECKED",
-					answers: {},
-					findings: [],
-					notes: "",
-					failure: { stage: isConfiguredByteCap ? "transport" : "budget", message: msg },
-					cost: { billedUsd: null, marketUsd: null, unknown: true },
-					usage: { requestBytes: built.bytes, responseBytes: 0, attempts: 0 },
-					requestId,
-					requestHash,
-					requestBody,
-					responseHash: "",
-					origin: "live",
-				});
+			})();
+
+			// Select the final packet and questions for dispatch.
+			let dispatchBody: string;
+			let dispatchBytes: number;
+			let dispatchHash: string;
+			let dispatchQuestions: readonly Question[];
+			let fallbackNote: string | null = null;
+
+			if (originalExceedsConfigured || originalExceedsConservative) {
+				// Build compact fallback packet from already-scrubbed state and exact questions.
+				const fallback = buildFallbackPacket(kind, state, questions, scrub, options.model, options.maxRequestBytes);
+				if (fallback === null) {
+					return finish({
+						ok: false,
+						status: "UNCHECKED",
+						answers: {},
+						findings: [],
+						notes: "",
+						failure: { stage: "budget", message: "oversize fallback still exceeds configured/conservative limits" },
+						cost: { billedUsd: null, marketUsd: null, unknown: true },
+						usage: { requestBytes: built.bytes, responseBytes: 0, attempts: 0 },
+						requestId,
+						requestHash,
+						requestBody,
+						responseHash: "",
+						origin: "live",
+						partialCoverage: true,
+					});
+				}
+
+				dispatchBody = fallback.built.body;
+				dispatchBytes = fallback.built.bytes;
+				dispatchHash = fallback.built.hash;
+				dispatchQuestions = fallback.questions;
+				fallbackNote = "fallback partial context sent";
+			} else {
+				dispatchBody = requestBody;
+				dispatchBytes = built.bytes;
+				dispatchHash = requestHash;
+				dispatchQuestions = questions;
 			}
+
+			// Use the selected packet for dispatch.
+			const finalRequestBody = dispatchBody;
+			const finalRequestHash = dispatchHash;
+			const finalRequestBytes = dispatchBytes;
+			const finalQuestions = dispatchQuestions;
 
 			// --- dispatch, with the 503 retry schedule --------------------------------
 			// Every failure except a clean HTTP 503 is final. A 503 is retried on the
@@ -511,7 +925,7 @@ export function createHttpClient(options: HttpClientOptions): JevClient {
 			const dispatch = (remainingMs: number): Promise<ExchangeOutcome> => postAssessment({
 				endpoint: options.endpoint,
 				apiKey,
-				body: requestBody,
+				body: finalRequestBody,
 				deadlineMs: remainingMs,
 				maxResponseBytes: options.maxResponseBytes,
 				signal,
@@ -569,7 +983,7 @@ export function createHttpClient(options: HttpClientOptions): JevClient {
 			const artifact = responseArtifact(exchange);
 
 			if (!exchange.ok) {
-				const transportNote = scrub([exchange.error ?? "request failed", retryNote].filter(Boolean).join("; "));
+				const transportNote = scrub([exchange.error ?? "request failed", retryNote, fallbackNote].filter(Boolean).join("; "));
 				return finish({
 					ok: false,
 					status: "UNCHECKED",
@@ -578,33 +992,35 @@ export function createHttpClient(options: HttpClientOptions): JevClient {
 					notes: transportNote,
 					failure: { stage: "transport", message: transportNote },
 					cost: { billedUsd: null, marketUsd: null, unknown: true },
-					usage: { requestBytes: built.bytes, responseBytes: exchange.bytes, attempts },
+					usage: { requestBytes: finalRequestBytes, responseBytes: exchange.bytes, attempts },
 					requestId,
-					requestHash,
-					requestBody,
+					requestHash: finalRequestHash,
+					requestBody: finalRequestBody,
 					responseHash: artifact.responseHash,
 					...(artifact.responseBody !== undefined ? { responseBody: artifact.responseBody } : {}),
 					origin: "live",
+					partialCoverage: fallbackNote !== null,
 				});
 			}
 
-			const validated = validateResponse(exchange.payload, questions);
+			const validated = validateResponse(exchange.payload, finalQuestions);
 			if (!validated.ok) {
 				return finish({
 					ok: false,
 					status: "UNCHECKED",
 					answers: {},
 					findings: [],
-					notes: scrub(validated.problems.join("; ")),
+					notes: scrub([validated.problems.join("; "), fallbackNote].filter(Boolean).join("; ")),
 					failure: { stage: "validation", message: scrub(validated.problems.join("; ")) },
 					cost: validated.cost,
-					usage: { requestBytes: built.bytes, responseBytes: exchange.bytes, attempts },
+					usage: { requestBytes: finalRequestBytes, responseBytes: exchange.bytes, attempts },
 					requestId,
-					requestHash,
-					requestBody,
+					requestHash: finalRequestHash,
+					requestBody: finalRequestBody,
 					responseHash: artifact.responseHash,
 					...(artifact.responseBody !== undefined ? { responseBody: artifact.responseBody } : {}),
 					origin: "live",
+					partialCoverage: fallbackNote !== null,
 				});
 			}
 			return finish({
@@ -616,15 +1032,16 @@ export function createHttpClient(options: HttpClientOptions): JevClient {
 				findings: [],
 				// A 503 that a retry rescued is still worth saying so: the attempt count
 				// tells how many requests went out, and the first failure is not hidden.
-				notes: scrub([validated.providerId ? `provider id ${validated.providerId}` : "", retryNote].filter(Boolean).join("; ")),
+				notes: scrub([validated.providerId ? `provider id ${validated.providerId}` : "", retryNote, fallbackNote].filter(Boolean).join("; ")),
 				cost: validated.cost,
-				usage: { requestBytes: built.bytes, responseBytes: exchange.bytes, attempts },
+				usage: { requestBytes: finalRequestBytes, responseBytes: exchange.bytes, attempts },
 				requestId,
-				requestHash,
-				requestBody,
+				requestHash: finalRequestHash,
+				requestBody: finalRequestBody,
 				responseHash: artifact.responseHash,
 				...(artifact.responseBody !== undefined ? { responseBody: artifact.responseBody } : {}),
 				origin: "live",
+				partialCoverage: fallbackNote !== null,
 			});
 		},
 	};
