@@ -52,6 +52,15 @@ test("completion distinguishes contradicted from not established", () => {
 	assert.deepEqual(Object.keys(question.criteria), ["SUPPORTED", "CONTRADICTED", "NOT_ESTABLISHED"]);
 });
 
+test("an open concern receives an independent semantic outcome question", () => {
+	const value = ledger();
+	value.concerns = [{ id: "c1", kind: "concern", text: "prior timeout contradiction", source: "jev:r1", status: "open" }];
+	const packet = buildAssessmentPacket(value, { selector: "s2", softPayloadBytes: 4096, assessmentScope: { kind: "proposal", targetId: "p1" } }).packet;
+	const outcome = buildCorrectionQuestions(packet).find((question) => question.id === "concern_outcome");
+	assert.deepEqual(Object.keys(outcome?.criteria ?? {}), ["RESOLVED", "PERSISTS", "UNKNOWN"]);
+	assert.match(outcome?.instructions ?? "", /acknowledgement alone is not resolution/);
+});
+
 test("strong action requires supported grounding and a qualifying concern", () => {
 	const base = {
 		correction: { choice: "CORRECTION_JUSTIFIED", probabilities: { CORRECTION_JUSTIFIED: .9, NO_CORRECTION_JUSTIFIED: .08, INSUFFICIENT_EVIDENCE: .02 } },

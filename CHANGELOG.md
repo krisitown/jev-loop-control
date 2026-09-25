@@ -5,6 +5,16 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
+## 0.4.0-dev.4 - 2026-09-26
+
+- Integrates configurable proposal cadence, completion scheduling, evidence
+  deduplication, and checkpoint cooldown into the production adapter.
+- Tracks queued advice, actual delivery, the next actor response, bounded expiry,
+  and Jev-assessed concern outcomes. Expiry and acknowledgement never imply
+  resolution; only a sufficiently supported RESOLVED answer records resolution.
+- Adds focused tuning module entry points for packet, questions, policy,
+  lifecycle, and scheduler replay tooling.
+
 ## 0.4.0-dev.3 - 2026-09-26
 
 - Preserves complete sanitized tool-result sources locally before legacy wire

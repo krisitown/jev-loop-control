@@ -13,7 +13,7 @@ import { applyCompletionContinuation, applyDirectionBlock } from "./intervention
 import { assessmentBudgetReason, retryRequestBudget, retryRequestBudgetReason } from "./budget.ts";
 import type { ToolCallEventResult, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import { createRecovery, advanceRecovery, recoveryInstruction, beginRecovery, recoveryEvidenceKey, type RecoveryState, type RecoveryMode } from "./recovery.ts";
-import { buildAssessmentPacket, buildCompletionQuestions, buildCorrectionQuestions, decideCorrectionAssessment, decideTunedCompletion, ledgerFromSnapshot } from "./supervisor-tuning.ts";
+import { buildAssessmentPacket, buildCompletionQuestions, buildCorrectionQuestions, decideCorrectionAssessment, decideTunedCompletion, ledgerFromSnapshot, shouldScheduleCheckpoint } from "./supervisor-tuning.ts";
 
 interface LiveState {
 	config: SupervisorConfig;
@@ -59,6 +59,9 @@ interface LiveState {
 	deferredSiblings: number;
 	/** Last guidance actually injected, so one recovery objective traces once. */
 	guidanceKey: string | null;
+	lastScheduledEvidenceHash: string | undefined;
+	checkpointsSinceAssessment: number;
+	respondedConcernKeys: Set<string>;
 }
 
 /** Our own injected guidance message; the context hook drops nothing else. */
@@ -194,6 +197,9 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			lastFailure: null,
 			deferredSiblings: 0,
 			guidanceKey: null,
+			lastScheduledEvidenceHash: undefined,
+			checkpointsSinceAssessment: Number.POSITIVE_INFINITY,
+			respondedConcernKeys: new Set(),
 		};
 
 		activation.reason = "";
@@ -261,6 +267,10 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 		const msg = event.message as Msg;
 		state.messages.push(msg);
 		if (msg.role === "assistant") {
+			if (state.recovery.active && state.guidanceKey && !state.respondedConcernKeys.has(state.recovery.active.focusKey)) {
+				state.respondedConcernKeys.add(state.recovery.active.focusKey);
+				state.trace.record("intervention.lifecycle", { stage: "actor_response", concernId: state.recovery.active.focusKey, proposalId: state.proposalId + 1 });
+			}
 			state.finalMessage = msg;
 			state.proposalNumber++;
 			state.proposalId = `p${state.proposalNumber}`;
@@ -269,6 +279,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 				const expired = advanceRecovery(state.recovery);
 				if (expired) {
 					state.trace.record("recovery.expired", { mode: prevActive.mode, objective: prevActive.objective });
+					state.trace.record("intervention.lifecycle", { stage: "expired", concernId: prevActive.focusKey, proposalId: state.proposalId + 1, resolved: false });
 				}
 			}
 			if (toolCallsOf(msg).length > 0) {
@@ -347,6 +358,13 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 				branch: ctx.sessionManager.getLeafId() ?? "main",
 			},
 		});
+		if (s.config.tuning.enabled) {
+			const schedule = shouldScheduleCheckpoint({ kind: "proposal", ordinal: s.proposalNumber, evidenceHash: snapshot.scope.snapshotHash, ...(s.lastScheduledEvidenceHash ? { lastEvidenceHash: s.lastScheduledEvidenceHash } : {}), checkpointsSinceAssessment: s.checkpointsSinceAssessment }, { proposalEvery: s.config.tuning.proposalEvery, toolResultEvery: 0, completion: s.config.tuning.completionEnabled, cooldownCheckpoints: s.config.tuning.cooldownCheckpoints });
+			s.trace.record("assessment.schedule", { kind: "direction", scheduled: schedule.scheduled, reason: schedule.reason, proposalId: s.proposalId, evidenceHash: snapshot.scope.snapshotHash });
+			if (!schedule.scheduled) { s.checkpointsSinceAssessment++; return undefined; }
+			s.lastScheduledEvidenceHash = snapshot.scope.snapshotHash;
+			s.checkpointsSinceAssessment = 0;
+		}
 
 		let tunedPacket = s.config.tuning.enabled
 			? buildAssessmentPacket(ledgerFromSnapshot(snapshot), {
@@ -408,6 +426,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			const decision = s.config.tuning.enabled
 				? decideCorrectionAssessment(a, snapshot, s.config, { budgetAvailable: s.config.limits.maxInterventionsPerTask === null || s.interventionsUsed < s.config.limits.maxInterventionsPerTask, packet: tunedPacket!.packet })
 				: decideDirection({ kind: "direction", assessment: a, snapshot, config: s.config, counters: { interventionsUsed: s.interventionsUsed, terminalContinuationsUsed: s.terminalContinuationsUsed, assessmentsUsed: s.assessmentsUsed, lastFocusKey: s.lastFocusKey, newEvidence: s.newEvidence } });
+			recordConcernOutcome(s, a);
 			if (!a.ok) {
 				const msg = s.scrub(a.failure?.message ?? "assessment failed");
 				if (s.lastFailure !== msg) {
@@ -496,6 +515,13 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 						branch: ctx.sessionManager.getLeafId() ?? "main",
 					},
 				});
+				if (s.config.tuning.enabled) {
+					const schedule = shouldScheduleCheckpoint({ kind: "completion", ordinal: s.proposalNumber, evidenceHash: snapshot.scope.snapshotHash, ...(s.lastScheduledEvidenceHash ? { lastEvidenceHash: s.lastScheduledEvidenceHash } : {}), checkpointsSinceAssessment: s.checkpointsSinceAssessment }, { proposalEvery: s.config.tuning.proposalEvery, toolResultEvery: 0, completion: s.config.tuning.completionEnabled, cooldownCheckpoints: s.config.tuning.cooldownCheckpoints });
+					s.trace.record("assessment.schedule", { kind: "completion", scheduled: schedule.scheduled, reason: schedule.reason, proposalId: s.proposalId, evidenceHash: snapshot.scope.snapshotHash });
+					if (!schedule.scheduled) { s.checkpointsSinceAssessment++; return; }
+					s.lastScheduledEvidenceHash = snapshot.scope.snapshotHash;
+					s.checkpointsSinceAssessment = 0;
+				}
 				let tunedPacket = s.config.tuning.enabled ? buildAssessmentPacket(ledgerFromSnapshot(snapshot), { selector: s.config.tuning.selector, softPayloadBytes: s.config.tuning.softPayloadBytes, assessmentScope: { kind: "completion", targetId: `proposal:${snapshot.target.proposalHash}` } }) : null;
 				let questions = tunedPacket ? buildCompletionQuestions(tunedPacket.packet) : buildQuestions("completion", snapshot);
 				if (tunedPacket) {
@@ -551,6 +577,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 					const decision = s.config.tuning.enabled
 						? decideTunedCompletion(a, snapshot, s.config, { budgetAvailable: s.config.limits.maxInterventionsPerTask === null || s.interventionsUsed < s.config.limits.maxInterventionsPerTask, packet: tunedPacket!.packet })
 						: decideCompletion({ kind: "completion", assessment: a, snapshot, config: s.config, counters: { interventionsUsed: s.interventionsUsed, terminalContinuationsUsed: s.terminalContinuationsUsed, assessmentsUsed: s.assessmentsUsed, lastFocusKey: s.lastFocusKey, newEvidence: s.newEvidence } });
+					recordConcernOutcome(s, a);
 					if (!a.ok) {
 						const msg = s.scrub(a.failure?.message ?? "assessment failed");
 						if (s.lastFailure !== msg) {
@@ -804,6 +831,26 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 		const message = `${a.notes ?? ""} ${a.failure?.message ?? ""}`;
 		const match = /(http 503[^;]*)/.exec(message);
 		return match ? match[1]!.trim() : null;
+	}
+
+	function recordConcernOutcome(s: LiveState, assessment: Assessment): void {
+		if (!s.config.tuning.enabled || !s.recovery.active) return;
+		const answer = assessment.answers.concern_outcome;
+		if (answer?.type !== "choice") return;
+		const probability = answer.probabilities[answer.choice] ?? 0;
+		const runner = Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, value]) => value));
+		const grounded = probability >= s.config.tuning.softThreshold && probability - runner >= s.config.tuning.softMinGap;
+		if (!grounded || answer.choice === "UNKNOWN") {
+			s.trace.record("intervention.lifecycle", { stage: "outcome_unknown", concernId: s.recovery.active.focusKey, probability, requestId: assessment.requestId });
+			return;
+		}
+		if (answer.choice === "RESOLVED") {
+			s.trace.record("intervention.lifecycle", { stage: "resolved", concernId: s.recovery.active.focusKey, probability, requestId: assessment.requestId, basis: "jev_concern_outcome" });
+			s.recovery.active = null;
+			s.guidanceKey = null;
+			return;
+		}
+		s.trace.record("intervention.lifecycle", { stage: "persists", concernId: s.recovery.active.focusKey, probability, requestId: assessment.requestId, basis: "jev_concern_outcome" });
 	}
 
 	function applyToolCallDecision(s: LiveState, decision: Decision | undefined, event: ToolCallEvent, ctx: ExtensionContext): ToolCallEventResult | undefined {

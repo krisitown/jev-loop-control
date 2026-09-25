@@ -25,7 +25,9 @@ export type QuestionRole =
 	| "primary_concern"
 	| "evidence_anchor"
 	| "requirement_focus"
-	| "completion_status";
+	| "completion_status"
+	| "concern_outcome";
+
 
 export interface ChoiceCriteria {
 	[option: string]: string;

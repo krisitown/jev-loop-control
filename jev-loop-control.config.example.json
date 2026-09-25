@@ -20,7 +20,10 @@
     "softThreshold": 0.62,
     "strongThreshold": 0.84,
     "softMinGap": 0.12,
-    "strongMinGap": 0.24
+    "strongMinGap": 0.24,
+    "proposalEvery": 1,
+    "completionEnabled": true,
+    "cooldownCheckpoints": 0
   },
   "trace": {
     "dir": null,

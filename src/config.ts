@@ -73,6 +73,9 @@ export interface TuningSection {
 	strongThreshold: number;
 	softMinGap: number;
 	strongMinGap: number;
+	proposalEvery: number;
+	completionEnabled: boolean;
+	cooldownCheckpoints: number;
 }
 
 /**
@@ -160,7 +163,7 @@ export function defaultConfig(): SupervisorConfig {
 			gapThreshold: 0.2,
 			repeatDiagnosticThreshold: 0.85,
 		},
-		tuning: { enabled: false, selector: "s2", softPayloadBytes: 24_576, softThreshold: 0.62, strongThreshold: 0.84, softMinGap: 0.12, strongMinGap: 0.24 },
+		tuning: { enabled: false, selector: "s2", softPayloadBytes: 24_576, softThreshold: 0.62, strongThreshold: 0.84, softMinGap: 0.12, strongMinGap: 0.24, proposalEvery: 1, completionEnabled: true, cooldownCheckpoints: 0 },
 		limits: {
 			maxInterventionsPerTask: null,
 			maxTerminalContinuations: 2,
@@ -454,7 +457,7 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, io
 	}
 	const tuning = reader.object("tuning", file.tuning);
 	if (tuning) {
-		reader.checkKeys({ path: "tuning", value: tuning, allowed: ["enabled", "selector", "softPayloadBytes", "softThreshold", "strongThreshold", "softMinGap", "strongMinGap"] });
+		reader.checkKeys({ path: "tuning", value: tuning, allowed: ["enabled", "selector", "softPayloadBytes", "softThreshold", "strongThreshold", "softMinGap", "strongMinGap", "proposalEvery", "completionEnabled", "cooldownCheckpoints"] });
 		config.tuning = {
 			enabled: reader.boolean(tuning, "tuning", "enabled", base.tuning.enabled),
 			selector: reader.string(tuning, "tuning", "selector", base.tuning.selector, { oneOf: ["s1", "s2"] }) as "s1" | "s2",
@@ -463,6 +466,9 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, io
 			strongThreshold: reader.number(tuning, "tuning", "strongThreshold", base.tuning.strongThreshold, { min: 0, max: 1 }),
 			softMinGap: reader.number(tuning, "tuning", "softMinGap", base.tuning.softMinGap, { min: 0, max: 1 }),
 			strongMinGap: reader.number(tuning, "tuning", "strongMinGap", base.tuning.strongMinGap, { min: 0, max: 1 }),
+			proposalEvery: reader.number(tuning, "tuning", "proposalEvery", base.tuning.proposalEvery, { min: 1, max: 1000, integer: true }),
+			completionEnabled: reader.boolean(tuning, "tuning", "completionEnabled", base.tuning.completionEnabled),
+			cooldownCheckpoints: reader.number(tuning, "tuning", "cooldownCheckpoints", base.tuning.cooldownCheckpoints, { min: 0, max: 1000, integer: true }),
 		};
 		if (config.tuning.strongThreshold < config.tuning.softThreshold) reader.fail("tuning.strongThreshold", "must be >= tuning.softThreshold");
 	}
@@ -474,7 +480,7 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, io
 			maxInterventionsPerTask: reader.nullableNumber(limits, "limits", "maxInterventionsPerTask", base.limits.maxInterventionsPerTask, { min: 0, max: 100, integer: true }),
 			maxTerminalContinuations: reader.number(limits, "limits", "maxTerminalContinuations", base.limits.maxTerminalContinuations, { min: 0, max: 100, integer: true }),
 			maxAssessments: reader.nullableNumber(limits, "limits", "maxAssessments", base.limits.maxAssessments, { min: 0, max: 1000, integer: true }),
-			proposalLease: reader.number(limits, "limits", "proposalLease", base.limits.proposalLease, { min: 1, max: 10, integer: true }),
+			proposalLease: reader.number(limits, "limits", "proposalLease", base.limits.proposalLease, { min: 1, max: 4, integer: true }),
 			maxEvidenceChars: reader.number(limits, "limits", "maxEvidenceChars", base.limits.maxEvidenceChars, { min: 500, max: 200_000, integer: true }),
 			maxProposalChars: reader.number(limits, "limits", "maxProposalChars", base.limits.maxProposalChars, { min: 1000, max: 1_000_000, integer: true }),
 		};
