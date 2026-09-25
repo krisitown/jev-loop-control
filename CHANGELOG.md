@@ -5,6 +5,12 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
+## 0.4.0-dev.5 - 2026-09-26
+
+- Scopes issue identity to the session branch, preserves explicit unresolved and
+  unchecked outcomes, and exposes deterministic scheduling-profile comparison.
+- Final offline-validation checkpoint before adapter fixture review.
+
 ## 0.4.0-dev.4 - 2026-09-26
 
 - Integrates configurable proposal cadence, completion scheduling, evidence

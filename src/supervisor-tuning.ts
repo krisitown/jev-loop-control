@@ -288,6 +288,13 @@ export function shouldScheduleCheckpoint(input: ScheduleInput, profile: Schedule
 	return { scheduled: input.ordinal % every === 0, reason: input.ordinal % every === 0 ? `${input.kind}_interval` : `${input.kind}_interval_skip` };
 }
 
+export function compareSchedulingProfiles(inputs: ScheduleInput[], profiles: Record<string, SchedulerProfile>): Array<{ profile: string; scheduled: number; total: number; decisions: Array<{ scheduled: boolean; reason: string }> }> {
+	return Object.entries(profiles).map(([profile, value]) => {
+		const decisions = inputs.map((input) => shouldScheduleCheckpoint(input, value));
+		return { profile, scheduled: decisions.filter((decision) => decision.scheduled).length, total: decisions.length, decisions };
+	});
+}
+
 /** Compatibility adapter from the current immutable snapshot into the v2 ledger. */
 export function ledgerFromSnapshot(snapshot: EvidenceSnapshot): EvidenceLedger {
 	const rep = snapshot.representation as { history?: { text?: string }; observations?: Array<Record<string, unknown>>; recent_actions?: Array<Record<string, unknown>> };
@@ -317,14 +324,16 @@ export function decideCorrectionAssessment(assessment: Assessment, snapshot: Evi
 		availableAnchorIds: [...packet.recent_evidence, ...packet.trajectory, ...packet.open_concerns].map((item) => item.id),
 		availableRequirementIds: packet.applicable_requirements.map((item) => item.id), ...flags,
 	}, { softThreshold: config.tuning.softThreshold, strongThreshold: config.tuning.strongThreshold, softMinGap: config.tuning.softMinGap, strongMinGap: config.tuning.strongMinGap, strongConcerns: ["CONTRACT_CONTRADICTION", "CONTRADICTED_DIAGNOSIS", "UNSUPPORTED_COMPLETION"] });
-	const focusKey = result.concern && result.anchorId ? `correction:${result.concern}:${result.anchorId}` : null;
+	const focusKey = result.concern && result.anchorId ? `correction:${snapshot.scope.branch}:${result.concern}:${result.anchorId}` : null;
 	const anchor = [...packet.recent_evidence, ...packet.trajectory, ...packet.open_concerns].find((item) => item.id === result.anchorId);
 	const requirement = packet.applicable_requirements.find((item) => item.id === result.requirementId);
 	const memo = result.action === "none" ? null : `Jev identified ${result.concern}. Evidence (${anchor?.id ?? "unknown"}): ${anchor?.text.slice(0, 500) ?? "unavailable"}${requirement ? ` Requirement (${requirement.id}): ${requirement.text.slice(0, 500)}` : ""} Change the next action to address this evidence, then rerun the directly relevant check and stop when it passes or produces a new specific diagnosis.`;
 	return {
 		assessment,
 		apply: result.action === "strong" ? "block" : result.action === "soft" ? "continue" : "none",
-		status: result.action === "none" ? (assessment.ok ? "EXECUTE" : "UNCHECKED") : "REPLAN",
+		status: result.action === "none"
+			? (!assessment.ok || result.suppressionReason === "unavailable" ? "UNCHECKED" : result.suppressionReason === "insufficient_evidence" || result.suppressionReason === "unsupported_grounding" ? "UNRESOLVED" : "EXECUTE")
+			: "REPLAN",
 		reasons: [result.action === "none" ? `suppressed:${result.suppressionReason ?? "none"}` : `action:${result.action}`, `correction_score:${result.correctionScore.toFixed(3)}`, `grounded:${result.grounded}`],
 		memo,
 		focusKey,
