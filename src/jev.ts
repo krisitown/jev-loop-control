@@ -5,11 +5,13 @@
  * is honoured during both the fetch and the body read, a total deadline bounds
  * the whole exchange, and the response is capped in bytes.
  *
- * The ONE exception to "one request": an HTTP 503 is retried exactly once after
- * 500ms (see `HTTP_503_RETRY_DELAY_MS`). Overloaded servers are the only case we
- * pay for twice, and the retry stays inside the same total deadline and abort
- * signal. Nothing else is ever retried: no other HTTP code, no malformed or
- * invalid response, no deadline, no cancellation, no missing key.
+ * The ONE exception to "one request": an HTTP 503 is retried on a fixed backoff
+ * schedule (`HTTP_503_RETRY_DELAYS_MS`: 500ms, 1000ms, 2000ms) up to
+ * `HTTP_503_MAX_ATTEMPTS` total dispatched requests (initial + 3 retries).
+ * Overloaded servers are the only case we pay for twice, and every attempt stays
+ * inside the same total deadline and abort signal. Nothing else is ever retried:
+ * no other HTTP code, no malformed or invalid response, no deadline, no
+ * cancellation, no missing key.
  *
  * Answers are validated against the exact question map that was sent, using the
  * TypeSafe-compatible shapes:
@@ -27,9 +29,14 @@ import { optionIds, type Answer, type Assessment, type AssessmentKind, type Cost
 export const PROBABILITY_SUM_TOLERANCE = 0.02;
 export const SELECTED_PROBABILITY_TOLERANCE = 1e-6;
 
-/** The only status ever retried, and the only wait we take. Exactly one retry. */
+/** The only status ever retried. */
 export const HTTP_503_RETRY_STATUS = 503;
-export const HTTP_503_RETRY_DELAY_MS = 500;
+/** The exponential wait BEFORE each retry: 500ms, 1000ms, 2000ms. */
+export const HTTP_503_RETRY_DELAYS_MS = [500, 1000, 2000] as const;
+/** Total dispatched requests for one assessment: the initial one plus 3 retries. */
+export const HTTP_503_MAX_ATTEMPTS = HTTP_503_RETRY_DELAYS_MS.length + 1;
+/** Default overall deadline when the caller gave none. */
+export const DEFAULT_JEV_DEADLINE_MS = 10_000;
 
 /**
  * True only for "the server is overloaded right now": HTTP 503 with a
@@ -66,7 +73,7 @@ export function sleepOrAbort(ms: number, signal: AbortSignal | undefined): Promi
 export interface RetryBudgetInput {
 	/** The failed 503 exchange; its unknown cost is already counted by the caller. */
 	kind: AssessmentKind;
-	/** Attempts already dispatched for this assessment, always 1 here. */
+	/** Attempts already dispatched for this assessment, including failed 503s. */
 	attempts: number;
 }
 
@@ -83,10 +90,10 @@ export interface HttpClientOptions {
 	/** Extra literal values to strip from anything we store (e.g. the key). */
 	secrets?: readonly string[];
 	/**
-	 * Optional gate for the single 503 retry. The client has no budget of its own:
+	 * Optional gate for each 503 retry. The client has no budget of its own:
 	 * the adapter owns the request cap and the monetary allowance, so it answers
-	 * whether a second dispatched request is affordable. `undefined` means "no
-	 * retry budget configured", and the retry is then never taken.
+	 * whether the next dispatched request is affordable. `undefined` means "no
+	 * retry budget configured", and no retry is then ever taken.
 	 */
 	retryBudget?: (input: RetryBudgetInput) => { allowed: boolean; reason?: string };
 }
@@ -478,11 +485,12 @@ export function createHttpClient(options: HttpClientOptions): JevClient {
 					origin: "live",
 				});
 			}
-			// --- dispatch, with the ONE 503 retry -------------------------------------
-			// Every failure except a clean HTTP 503 is final. A 503 is retried at most
-			// once, after 500ms, inside the same total deadline and abort signal, and
-			// only when the caller's retry budget allows another dispatched request.
-			// The retry's own outcome is never retried again.
+			// --- dispatch, with the 503 retry schedule --------------------------------
+			// Every failure except a clean HTTP 503 is final. A 503 is retried on the
+			// exponential waits (500/1000/2000ms) up to HTTP_503_MAX_ATTEMPTS dispatched
+			// requests, inside the same total deadline and abort signal, and only when
+			// the caller's retry budget allows the next dispatched request. The gate is
+			// asked BEFORE every retry with the actual attempts dispatched so far.
 			const dispatch = (remainingMs: number): Promise<ExchangeOutcome> => postAssessment({
 				endpoint: options.endpoint,
 				apiKey,
@@ -493,44 +501,52 @@ export function createHttpClient(options: HttpClientOptions): JevClient {
 				fetchImpl: options.fetchImpl,
 			});
 
-			let exchange = await dispatch(deadlineMs);
+			const overallDeadlineMs = deadlineMs > 0 ? deadlineMs : DEFAULT_JEV_DEADLINE_MS;
+			let exchange = await dispatch(overallDeadlineMs);
 			let attempts = exchange.attempts;
 			let retryNote: string | null = null;
-			if (!exchange.ok && isRetryable503(exchange)) {
+			while (!exchange.ok && isRetryable503(exchange)) {
+				if (attempts >= HTTP_503_MAX_ATTEMPTS) {
+					retryNote ??= `http 503: retry limit reached after ${attempts} attempts`;
+					break;
+				}
 				// The failed attempt's cost is unknown and stays unknown; the caller's
-				// reservation for it stays armed. This asks for room for ONE more.
+				// reservation for it stays armed. This asks for room for ONE more,
+				// with the actual attempts dispatched so far.
 				const budget = options.retryBudget?.({ kind, attempts });
 				if (!budget?.allowed) {
 					retryNote = `http 503: no retry (${budget?.reason ?? "retry budget not configured"})`;
+					break;
 				}
-				else {
-					const remaining = deadlineMs - Math.round(performance.now() - start);
-					if (remaining <= HTTP_503_RETRY_DELAY_MS) {
-						// A retry could not fit inside the original total deadline.
-						retryNote = `http 503: no retry (deadline has ${Math.max(0, remaining)}ms left, below the ${HTTP_503_RETRY_DELAY_MS}ms retry wait)`;
+				const waitMs = HTTP_503_RETRY_DELAYS_MS[attempts - 1] ?? HTTP_503_RETRY_DELAYS_MS.at(-1)!;
+				const remaining = overallDeadlineMs - Math.round(performance.now() - start);
+				if (remaining <= waitMs) {
+					// A retry could not fit inside the original total deadline.
+					retryNote = `http 503: no retry (deadline has ${Math.max(0, remaining)}ms left, below the ${waitMs}ms retry wait)`;
+					break;
+				}
+				try {
+					await sleepOrAbort(waitMs, signal);
+					// Recompute AFTER the wait: `remaining` is the pre-wait value,
+					// and dispatching with it would stretch the deadline by the wait.
+					const remainingAfterWait = overallDeadlineMs - Math.round(performance.now() - start);
+					if (remainingAfterWait <= 0) {
+						// The wait ate the whole deadline: no further request goes out.
+						retryNote = `http 503: retry skipped (deadline exhausted during the ${waitMs}ms wait)`;
+						break;
 					}
-					else {
-						try {
-							await sleepOrAbort(HTTP_503_RETRY_DELAY_MS, signal);
-							// Recompute AFTER the wait: `remaining` is the pre-wait value,
-							// and dispatching with it would stretch the deadline by the wait.
-							const remainingAfterWait = deadlineMs - Math.round(performance.now() - start);
-							if (remainingAfterWait <= 0) {
-								// The wait ate the whole deadline: no second request goes out.
-								retryNote = `http 503: retry skipped (deadline exhausted during the ${HTTP_503_RETRY_DELAY_MS}ms wait)`;
-							}
-							else {
-								const retry = await dispatch(remainingAfterWait);
-								attempts += retry.attempts;
-								exchange = retry;
-								retryNote = retry.ok ? `http 503 retried once after ${HTTP_503_RETRY_DELAY_MS}ms: succeeded` : `http 503 retried once after ${HTTP_503_RETRY_DELAY_MS}ms: ${retry.error ?? "still failing"}`;
-							}
-						}
-						catch {
-							// Cancelled during the wait: no second request was dispatched.
-							retryNote = `http 503: retry cancelled during the ${HTTP_503_RETRY_DELAY_MS}ms wait`;
-						}
-					}
+					const retry = await dispatch(remainingAfterWait);
+					attempts += retry.attempts;
+					exchange = retry;
+					retryNote = `http 503 retried ${attempts - 1} time(s) after exponential waits: ${retry.ok ? "succeeded" : retry.error ?? "still failing"}`;
+				}
+				catch {
+					// Cancelled during a wait: no further request was dispatched.
+					retryNote = `http 503: retry cancelled during the ${waitMs}ms wait`;
+					break;
+				}
+				if (!isRetryable503(exchange)) {
+					break;
 				}
 			}
 			const artifact = responseArtifact(exchange);
@@ -582,7 +598,7 @@ export function createHttpClient(options: HttpClientOptions): JevClient {
 				answers: validated.answers,
 				findings: [],
 				// A 503 that a retry rescued is still worth saying so: the attempt count
-				// is 2 and the first failure is not hidden.
+				// tells how many requests went out, and the first failure is not hidden.
 				notes: scrub([validated.providerId ? `provider id ${validated.providerId}` : "", retryNote].filter(Boolean).join("; ")),
 				cost: validated.cost,
 				usage: { requestBytes: built.bytes, responseBytes: exchange.bytes, attempts },

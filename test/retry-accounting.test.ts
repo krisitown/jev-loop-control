@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { createFixture, fauxAssistantMessage, fauxToolCall } from "./support/harness.ts";
+import { createHttpClient } from "../src/jev.ts";
 import { liveObserve } from "../src/live-observe.ts";
 import { readJsonLines } from "../src/trace.ts";
 import { retryRequestBudget, retryRequestBudgetReason, assessmentBudgetReason } from "../src/budget.ts";
@@ -12,17 +13,18 @@ import { defaultConfig, loadConfig } from "../src/config.ts";
 import type { Question } from "../src/types.ts";
 
 /**
- * ACTUAL accounting regressions for the single HTTP 503 retry, run through the
+ * ACTUAL accounting regressions for the HTTP 503 retry schedule (4 attempts max,
+ * 500/1000/2000ms waits), run through the
  * REAL production wiring: `liveObserve(pi, { fetchImpl })` builds the real
  * client inside the real adapter with the real retry gate reading the real
  * shared budget, and only the wire is scripted. Counters are then read back
  * out of summary.json/events.jsonl. There is deliberately NO mirrored budget
  * in this file: whatever the fixture's scripted fetch sees, production made it.
  *
- * The invariants (see review 32): the FIRST 503's cost is unknown no matter
- * what the retry finally reports, so every extra dispatched request keeps its
+ * The invariants (see review 32): EVERY failed 503's cost is unknown no matter
+ * what the retry finally reports, so each extra dispatched request keeps its
  * own reservation and stays an unknown cost, even on a known-cost success. A
- * retry is one assessment, never two, and it can never spend past
+ * retry schedule is one assessment, never several, and it can never spend past
  * `budget.maxRequests`.
  */
 
@@ -66,7 +68,7 @@ interface RunResult {
 
 async function runRetryFixture(
 	t: { after(fn: () => void): void },
-	options: { script: number[]; billedUsd: number | null; budget?: Record<string, unknown> },
+	options: { script: number[]; billedUsd: number | null; budget?: Record<string, unknown>; requestsUsedDuring?: number },
 ): Promise<RunResult> {
 	const supervisorDir = mkdtempSync(join(tmpdir(), "jev-retry-config-"));
 	const traceDir = join(supervisorDir, "traces");
@@ -113,6 +115,42 @@ async function runRetryFixture(
 		return new Response(JSON.stringify(body), { status: 200 });
 	}) as unknown as typeof fetch;
 
+	// By default the client, the retry gate, the shared budget object, and every
+	// counter are production code inside liveObserve. With `requestsUsedDuring`,
+	// the client and the gate are still the production `createHttpClient` +
+	// `retryRequestBudget`, bound to a probe budget that reports the requests
+	// already DISPATCHED inside this assessment (the adapter's own counter only
+	// learns the total afterwards), so the cap is tested against the attempt
+	// count the retry loop actually holds.
+	const requestsUsedDuring = options.requestsUsedDuring;
+	const factory: ExtensionFactory = requestsUsedDuring === undefined
+		? ((pi: ExtensionAPI) => {
+			liveObserve(pi, { fetchImpl });
+		})
+		: ((pi: ExtensionAPI) => {
+			const loaded = loadConfig(supervisorDir, { JEV_LOOP_CONTROL_CONFIG: configPath, [KEY_ENV]: FAKE_KEY });
+			const config = loaded.config ?? defaultConfig();
+			const gateBudget = { requestsUsed: 0, reservedUsd: 0, billedUsd: 0, marketUsd: 0, unknownCosts: 0 };
+			liveObserve(pi, {
+				client: createHttpClient({
+					endpoint: config.jev.endpoint,
+					model: config.jev.model,
+					apiKeyEnv: KEY_ENV,
+					deadlineMs: config.jev.deadlineMs,
+					maxRequestBytes: config.jev.maxRequestBytes,
+					maxResponseBytes: config.jev.maxResponseBytes,
+					secrets: [FAKE_KEY],
+					fetchImpl,
+					env: { ...process.env, [KEY_ENV]: FAKE_KEY },
+					retryBudget: ({ attempts }) => {
+						gateBudget.requestsUsed = requestsUsedDuring + Math.max(0, attempts - 1);
+						gateBudget.reservedUsd = config.budget.reserveUsdPerRequest * attempts;
+						return retryRequestBudget(config, gateBudget);
+					},
+				}),
+			});
+		});
+
 	const fixture = await createFixture({
 		script: [
 			fauxAssistantMessage([fauxToolCall("write_toy", { path: "notes.txt", text: "x" }, { id: "call-write" })]),
@@ -122,9 +160,7 @@ async function runRetryFixture(
 		// `undefined` makes the harness DELETE the mode override, exactly like the
 		// live-steering suite: without it the config's own mode never applies.
 		env: { [KEY_ENV]: FAKE_KEY, JEV_LOOP_CONTROL_CONFIG: configPath, JEV_LOOP_CONTROL_MODE: undefined },
-		extensions: [{ name: "jev-retry-accounting", factory: ((pi: ExtensionAPI) => {
-			liveObserve(pi, { fetchImpl });
-		}) satisfies ExtensionFactory }],
+		extensions: [{ name: "jev-retry-accounting", factory }],
 	});
 	t.after(() => fixture.dispose());
 
@@ -176,7 +212,7 @@ test("accounting: 503 then known-cost 200 leaves the failed attempt reserved and
 	assert.equal(run.calls, 2, "exactly two HTTP requests");
 	const view = retryView(run);
 	assert.equal(view.attempts, 2);
-	assert.match(view.note ?? "", /http 503 retried once after 500ms: succeeded/);
+	assert.match(view.note ?? "", /http 503 retried 1 time\(s\) after exponential waits: succeeded/);
 	assert.equal(view.extra, 1);
 	assert.equal(view.traceUnknown, 1, "the retry trace counts the FIRST 503's unknown cost");
 
@@ -190,22 +226,43 @@ test("accounting: 503 then known-cost 200 leaves the failed attempt reserved and
 	assert.ok(Math.abs((budget.reservedUsd ?? 0) - 0.01) < 1e-9, `one failed-attempt reservation stays armed: ${budget.reservedUsd}`);
 });
 
-test("accounting: 503 twice leaves two unknowns and two reservations", { timeout: 60_000 }, async (t) => {
-	const run = await runRetryFixture(t, { script: [503, 503], billedUsd: null });
-	assert.equal(run.calls, 2);
+test("accounting: an all-503 exchange spends the whole schedule and leaves four unknowns and four reservations", { timeout: 60_000 }, async (t) => {
+	// No caps configured: the schedule, not the gate, ends the exchange at 4
+	// dispatched requests, and EVERY failed 503 keeps its own unknown cost and
+	// its own armed reservation. A fifth request is never dispatched.
+	const run = await runRetryFixture(t, { script: [503], billedUsd: null });
+	assert.equal(run.calls, 4, "initial plus 3 retries, never a fifth");
 	const view = retryView(run);
-	assert.equal(view.attempts, 2);
-	assert.match(view.note ?? "", /http 503 retried once after 500ms/);
+	assert.equal(view.attempts, 4);
+	assert.match(view.note ?? "", /http 503 retried 3 time\(s\) after exponential waits/);
 
 	const { requests, assessments, budget } = counters(run);
-	assert.equal(requests, 2);
-	assert.equal(assessments, 1);
-	assert.equal(budget.unknownCosts, 2, "both dispatched requests cost something nobody reported");
-	assert.ok(Math.abs((budget.reservedUsd ?? 0) - 0.02) < 1e-9, `both reservations stay armed: ${budget.reservedUsd}`);
+	assert.equal(requests, 4);
+	assert.equal(assessments, 1, "the whole retry schedule is still one assessment");
+	assert.equal(budget.unknownCosts, 4, "every dispatched request cost something nobody reported");
+	assert.ok(Math.abs((budget.reservedUsd ?? 0) - 0.04) < 1e-9, `all four reservations stay armed: ${budget.reservedUsd}`);
 	assert.equal(budget.billedUsd, 0);
 });
 
-test("accounting: maxRequests 1 denies the retry at the real gate, maxRequests 2 allows it", { timeout: 60_000 }, async (t) => {
+test("accounting: three 503s rescued by a known-cost attempt 4 keep every failed attempt unknown and reserved", { timeout: 120_000 }, async (t) => {
+	const run = await runRetryFixture(t, { script: [503, 503, 503, 200], billedUsd: 0.05 });
+	assert.equal(run.calls, 4, "exactly four HTTP requests");
+	const view = retryView(run);
+	assert.equal(view.attempts, 4);
+	assert.match(view.note ?? "", /http 503 retried 3 time\(s\) after exponential waits: succeeded/);
+	assert.equal(view.extra, 3);
+
+	const { requests, assessments, budget } = counters(run);
+	assert.equal(requests, 4, "all four dispatched requests are counted");
+	assert.equal(assessments, 1, "the retry schedule is still one assessment");
+	assert.equal(budget.billedUsd, 0.05, "billed is exactly what the FINAL response reported");
+	assert.equal(budget.unknownCosts, 3, "the failed 503s' costs are unknown even though the final cost was known");
+	// The final settlement subtracted ONE reservation; the retries' own
+	// reservations stay armed: 3 x reserveUsdPerRequest (the default 0.01).
+	assert.ok(Math.abs((budget.reservedUsd ?? 0) - 0.03) < 1e-9, `three failed-attempt reservations stay armed: ${budget.reservedUsd}`);
+});
+
+test("accounting: maxRequests 1 denies the retry at the real gate, maxRequests 2 allows exactly one retry", { timeout: 120_000 }, async (t) => {
 	// Cap already spent by the assessment's own request: the retry must not go out.
 	const capped = await runRetryFixture(t, { script: [503, 200], billedUsd: 0.05, budget: { maxRequests: 1 } });
 	assert.equal(capped.calls, 1, "a request cap of 1 leaves no room for a second dispatch");
@@ -213,11 +270,24 @@ test("accounting: maxRequests 1 denies the retry at the real gate, maxRequests 2
 	assert.match(retryView(capped).note ?? "", /http 503: no retry \(request cap reached \(1\/1\)\)/);
 	assert.equal(counters(capped).requests, 1);
 
-	// A cap of 2 has exactly the retry's room: the second dispatch goes out.
-	const allowed = await runRetryFixture(t, { script: [503, 200], billedUsd: 0.05, budget: { maxRequests: 2 } });
-	assert.equal(allowed.calls, 2, "a request cap of 2 leaves exactly the retry's room");
+	// A cap of 2 has exactly one retry's room: the second dispatch goes out, and
+	// the gate denies the third with the attempts already dispatched (2/2).
+	const allowed = await runRetryFixture(t, { script: [503, 503, 200], billedUsd: 0.05, budget: { maxRequests: 2 }, requestsUsedDuring: 1 });
+	assert.equal(allowed.calls, 2, "a request cap of 2 leaves exactly one retry's room");
 	assert.equal(retryView(allowed).attempts, 2);
+	assert.match(retryView(allowed).note ?? "", /http 503: no retry \(request cap reached \(2\/2\)\)/);
 	assert.equal(counters(allowed).requests, 2);
+});
+
+test("accounting: maxRequests 3 spends the cap on exactly two retries and stops at 3 attempts", { timeout: 120_000 }, async (t) => {
+	const capped = await runRetryFixture(t, { script: [503, 503, 503, 200], billedUsd: 0.05, budget: { maxRequests: 3 }, requestsUsedDuring: 1 });
+	assert.equal(capped.calls, 3, "the initial request plus two retries exhaust the cap; no fourth goes out");
+	assert.equal(retryView(capped).attempts, 3);
+	assert.match(retryView(capped).note ?? "", /http 503: no retry \(request cap reached \(3\/3\)\)/);
+	const { requests, budget } = counters(capped);
+	assert.equal(requests, 3);
+	assert.equal(budget.unknownCosts, 3, "all three dispatched 503s cost something nobody reported");
+	assert.ok(Math.abs((budget.reservedUsd ?? 0) - 0.03) < 1e-9, `all three reservations stay armed: ${budget.reservedUsd}`);
 });
 
 test("gate: retry budget ignores the assessment cap and keeps the ordinary preflight unchanged", () => {
