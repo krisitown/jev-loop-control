@@ -65,6 +65,16 @@ export interface PolicySection {
 	repeatDiagnosticThreshold: number;
 }
 
+export interface TuningSection {
+	enabled: boolean;
+	selector: "s1" | "s2";
+	softPayloadBytes: number;
+	softThreshold: number;
+	strongThreshold: number;
+	softMinGap: number;
+	strongMinGap: number;
+}
+
 /**
  * Design invariants, deliberately not configurable: a redirect always needs an
  * actionable focus, and work-mode advice is always guidance only. Exported so
@@ -110,6 +120,7 @@ export interface SupervisorConfig {
 	jev: JevSection;
 	budget: BudgetSection;
 	policy: PolicySection;
+	tuning: TuningSection;
 	limits: LimitSection;
 	trace: TraceSection;
 	/** Optional immutable task manifest; falls back to the original request. */
@@ -149,6 +160,7 @@ export function defaultConfig(): SupervisorConfig {
 			gapThreshold: 0.2,
 			repeatDiagnosticThreshold: 0.85,
 		},
+		tuning: { enabled: false, selector: "s2", softPayloadBytes: 24_576, softThreshold: 0.62, strongThreshold: 0.84, softMinGap: 0.12, strongMinGap: 0.24 },
 		limits: {
 			maxInterventionsPerTask: null,
 			maxTerminalContinuations: 2,
@@ -381,7 +393,7 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, io
 			reader.fail(configPath, `is not valid JSON (${error instanceof Error ? error.name : typeof error})`);
 			return { config: base, problems: reader.problems, notices: reader.notices };
 		}
-		reader.checkKeys({ path: "$", value: file, allowed: ["version", "mode", "jev", "budget", "policy", "limits", "trace", "taskManifestPath"] });
+		reader.checkKeys({ path: "$", value: file, allowed: ["version", "mode", "jev", "budget", "policy", "tuning", "limits", "trace", "taskManifestPath"] });
 	}
 
 	const config: SupervisorConfig = { ...base, configPath };
@@ -439,6 +451,20 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, io
 			gapThreshold: reader.number(policy, "policy", "gapThreshold", base.policy.gapThreshold, { min: 0, max: 1 }),
 			repeatDiagnosticThreshold: reader.number(policy, "policy", "repeatDiagnosticThreshold", base.policy.repeatDiagnosticThreshold, { min: 0, max: 1 }),
 		};
+	}
+	const tuning = reader.object("tuning", file.tuning);
+	if (tuning) {
+		reader.checkKeys({ path: "tuning", value: tuning, allowed: ["enabled", "selector", "softPayloadBytes", "softThreshold", "strongThreshold", "softMinGap", "strongMinGap"] });
+		config.tuning = {
+			enabled: reader.boolean(tuning, "tuning", "enabled", base.tuning.enabled),
+			selector: reader.string(tuning, "tuning", "selector", base.tuning.selector, { oneOf: ["s1", "s2"] }) as "s1" | "s2",
+			softPayloadBytes: reader.number(tuning, "tuning", "softPayloadBytes", base.tuning.softPayloadBytes, { min: 4096, max: 1_048_576, integer: true }),
+			softThreshold: reader.number(tuning, "tuning", "softThreshold", base.tuning.softThreshold, { min: 0, max: 1 }),
+			strongThreshold: reader.number(tuning, "tuning", "strongThreshold", base.tuning.strongThreshold, { min: 0, max: 1 }),
+			softMinGap: reader.number(tuning, "tuning", "softMinGap", base.tuning.softMinGap, { min: 0, max: 1 }),
+			strongMinGap: reader.number(tuning, "tuning", "strongMinGap", base.tuning.strongMinGap, { min: 0, max: 1 }),
+		};
+		if (config.tuning.strongThreshold < config.tuning.softThreshold) reader.fail("tuning.strongThreshold", "must be >= tuning.softThreshold");
 	}
 
 	const limits = reader.object("limits", file.limits);

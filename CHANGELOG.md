@@ -5,6 +5,16 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
+## 0.4.0-dev.1 - 2026-09-26
+
+- Adds an opt-in correction-diagnosis path with S1/S2 evidence packet selection,
+  intact question templates, separate soft/strong policy gates, grounded source
+  anchors, nonblocking advice delivery, and explicit lifecycle trace stages.
+- Adds pure packet, policy, lifecycle, and scheduler APIs for offline replay.
+- Global coverage remains unknown unless independently verified; byte counts are
+  measured on serialized UTF-8 and token counts remain explicitly unavailable.
+- Development checkpoint only. No live Jev or actor-continuation validation ran.
+
 ## 0.3.5 - 2026-09-25
 
 ### Changed

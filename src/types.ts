@@ -20,7 +20,12 @@ export type QuestionRole =
 	| "unproductive_repeat"
 	| "focus_requirement"
 	| "requirement"
-	| "final_claims_supported";
+	| "final_claims_supported"
+	| "correction_needed"
+	| "primary_concern"
+	| "evidence_anchor"
+	| "requirement_focus"
+	| "completion_status";
 
 export interface ChoiceCriteria {
 	[option: string]: string;

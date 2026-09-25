@@ -13,6 +13,15 @@
     "maxInterventionsPerTask": null,
     "maxTerminalContinuations": 2
   },
+  "tuning": {
+    "enabled": false,
+    "selector": "s2",
+    "softPayloadBytes": 24576,
+    "softThreshold": 0.62,
+    "strongThreshold": 0.84,
+    "softMinGap": 0.12,
+    "strongMinGap": 0.24
+  },
   "trace": {
     "dir": null,
     "artifacts": true

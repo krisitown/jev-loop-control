@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join, resolve, isAbsolute } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadConfig, type SupervisorConfig } from "./config.ts";
-import { createHttpClient } from "./jev.ts";
+import { buildRequestBody, createHttpClient } from "./jev.ts";
 import { buildSnapshot, resolveRequirements, isTerminalCandidate, toolCallsOf, type Msg } from "./evidence.ts";
 import { buildQuestions, buildState } from "./questions.ts";
 import { decideDirection, decideCompletion } from "./policy.ts";
@@ -13,6 +13,7 @@ import { applyCompletionContinuation, applyDirectionBlock } from "./intervention
 import { assessmentBudgetReason, retryRequestBudget, retryRequestBudgetReason } from "./budget.ts";
 import type { ToolCallEventResult, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import { createRecovery, advanceRecovery, recoveryInstruction, beginRecovery, recoveryEvidenceKey, type RecoveryState, type RecoveryMode } from "./recovery.ts";
+import { buildAssessmentPacket, buildCorrectionQuestions, decideCorrectionAssessment, ledgerFromSnapshot } from "./supervisor-tuning.ts";
 
 interface LiveState {
 	config: SupervisorConfig;
@@ -347,7 +348,22 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			},
 		});
 
-		const questions = buildQuestions("direction", snapshot);
+		let tunedPacket = s.config.tuning.enabled
+			? buildAssessmentPacket(ledgerFromSnapshot(snapshot), {
+				selector: s.config.tuning.selector,
+				softPayloadBytes: s.config.tuning.softPayloadBytes,
+				assessmentScope: { kind: "proposal", targetId: `proposal:${snapshot.target.proposalHash}` },
+			})
+			: null;
+		let questions = tunedPacket ? buildCorrectionQuestions(tunedPacket.packet) : buildQuestions("direction", snapshot);
+		if (tunedPacket) {
+			const firstEnvelope = buildRequestBody({ model: s.config.jev.model, state: tunedPacket.packet as unknown as Record<string, unknown>, questions });
+			if (firstEnvelope.bytes > s.config.tuning.softPayloadBytes) {
+				const reducedPacketTarget = Math.max(1024, s.config.tuning.softPayloadBytes - (firstEnvelope.bytes - tunedPacket.serializedBytes));
+				tunedPacket = buildAssessmentPacket(ledgerFromSnapshot(snapshot), { selector: s.config.tuning.selector, softPayloadBytes: reducedPacketTarget, assessmentScope: { kind: "proposal", targetId: `proposal:${snapshot.target.proposalHash}` } });
+				questions = buildCorrectionQuestions(tunedPacket.packet);
+			}
+		}
 		const controller = {
 			workMode: s.recovery.active?.mode ?? "EXECUTE",
 			proposalNumber: s.proposalNumber,
@@ -356,7 +372,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			previousInterventions: s.recovery.history.map(h => ({ kind: h.kind, status: h.status, focus: h.focus, at: h.at })),
 			recoveryObjective: s.recovery.active?.objective,
 		};
-		const stateEnvelope = buildState({ kind: "direction", snapshot, controller, proposalId: s.proposalId });
+		const stateEnvelope = tunedPacket ? tunedPacket.packet as unknown as Record<string, unknown> : buildState({ kind: "direction", snapshot, controller, proposalId: s.proposalId });
 
 		const reserve = s.config.budget.reserveUsdPerRequest;
 		s.budget.reservedUsd += reserve;
@@ -389,7 +405,9 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			const responsePath = a.responseBody !== undefined ? s.trace.artifact("response", a.responseBody, a.requestId) : null;
 			a.artifacts = { request: requestPath, response: responsePath };
 
-			const decision = decideDirection({ kind: "direction", assessment: a, snapshot, config: s.config, counters: { interventionsUsed: s.interventionsUsed, terminalContinuationsUsed: s.terminalContinuationsUsed, assessmentsUsed: s.assessmentsUsed, lastFocusKey: s.lastFocusKey, newEvidence: s.newEvidence } });
+			const decision = s.config.tuning.enabled
+				? decideCorrectionAssessment(a, snapshot, s.config, { budgetAvailable: s.config.limits.maxInterventionsPerTask === null || s.interventionsUsed < s.config.limits.maxInterventionsPerTask })
+				: decideDirection({ kind: "direction", assessment: a, snapshot, config: s.config, counters: { interventionsUsed: s.interventionsUsed, terminalContinuationsUsed: s.terminalContinuationsUsed, assessmentsUsed: s.assessmentsUsed, lastFocusKey: s.lastFocusKey, newEvidence: s.newEvidence } });
 			if (!a.ok) {
 				const msg = s.scrub(a.failure?.message ?? "assessment failed");
 				if (s.lastFailure !== msg) {
@@ -417,6 +435,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 				actualApply: "none",
 				proposalId: s.proposalId,
 				contextSelection: snapshot.representation.context_selection,
+				tuning: tunedPacket ? { selector: tunedPacket.packet.selector_version, packetHash: tunedPacket.hash, packetBytes: tunedPacket.serializedBytes, softPayloadBytes: tunedPacket.softPayloadBytes, overSoftTarget: tunedPacket.overSoftTarget, coverage: tunedPacket.packet.coverage } : null,
 				partialCoverage: a.partialCoverage ?? false,
 			});
 			return decision;
@@ -697,6 +716,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 					proposalId: s.proposalId,
 					content: instruction,
 				});
+				s.trace.record("intervention.lifecycle", { stage: "delivered", action: "soft", concernId: s.recovery.active.focusKey, proposalId: s.proposalId });
 			}
 		}
 		else {
@@ -782,6 +802,18 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 		}
 
 		const cap = s.config.limits.maxInterventionsPerTask;
+		if (decision && decision.apply === "continue" && s.config.mode === "enforce" && s.trace.enabled && !ctx.signal?.aborted && (cap === null || s.interventionsUsed < cap) && s.assessmentSnapshot && decision.memo && decision.focusKey) {
+			const applied = beginRecovery(s.recovery, { mode: "REPLAN", objective: decision.memo, focusKey: decision.focusKey, evidenceKey: recoveryEvidenceKey(s.assessmentSnapshot), at: new Date().toISOString() }, s.config.limits.proposalLease);
+			if (!applied) {
+				s.trace.record("intervention.suppressed", { reason: "duplicate_issue", proposalId: s.proposalId, requestId: decision.assessment.requestId });
+				return undefined;
+			}
+			s.interventionsUsed++;
+			s.lastFocusKey = decision.focusKey;
+			s.newEvidence = false;
+			for (const stage of ["selected", "applied", "queued"]) s.trace.record("intervention.lifecycle", { stage, action: "soft", concernId: decision.focusKey, proposalId: s.proposalId, requestId: decision.assessment.requestId });
+			return undefined;
+		}
 		if (decision && decision.apply === "block" && s.config.mode === "enforce" && s.trace.enabled && !ctx.signal?.aborted && (cap === null || s.interventionsUsed < cap)) {
 			if (s.assessmentSnapshot && decision.memo && decision.focusKey && ["RESEARCH", "REPLAN", "VERIFY", "EXECUTE"].includes(decision.status)) {
 				const applied = beginRecovery(s.recovery, {
@@ -808,6 +840,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			s.interventionsUsed++;
 			s.lastFocusKey = decision.focusKey;
 			s.newEvidence = false;
+			for (const stage of ["selected", "applied", "delivered"]) s.trace.record("intervention.lifecycle", { stage, action: "strong", concernId: decision.focusKey, proposalId: s.proposalId, requestId: decision.assessment.requestId });
 			s.trace.record("intervention.block", {
 				toolCallId: event.toolCallId,
 				toolName: event.toolName,
