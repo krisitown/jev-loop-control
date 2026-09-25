@@ -1,9 +1,15 @@
 /**
  * Jev transport and answer validation.
  *
- * One HTTP POST per assessment, no SDK, no framework, no automatic retry. The
- * caller's abort signal is honoured during both the fetch and the body read, a
- * total deadline bounds the whole exchange, and the response is capped in bytes.
+ * One HTTP POST per assessment, no SDK, no framework. The caller's abort signal
+ * is honoured during both the fetch and the body read, a total deadline bounds
+ * the whole exchange, and the response is capped in bytes.
+ *
+ * The ONE exception to "one request": an HTTP 503 is retried exactly once after
+ * 500ms (see `HTTP_503_RETRY_DELAY_MS`). Overloaded servers are the only case we
+ * pay for twice, and the retry stays inside the same total deadline and abort
+ * signal. Nothing else is ever retried: no other HTTP code, no malformed or
+ * invalid response, no deadline, no cancellation, no missing key.
  *
  * Answers are validated against the exact question map that was sent, using the
  * TypeSafe-compatible shapes:
@@ -21,6 +27,49 @@ import { optionIds, type Answer, type Assessment, type AssessmentKind, type Cost
 export const PROBABILITY_SUM_TOLERANCE = 0.02;
 export const SELECTED_PROBABILITY_TOLERANCE = 1e-6;
 
+/** The only status ever retried, and the only wait we take. Exactly one retry. */
+export const HTTP_503_RETRY_STATUS = 503;
+export const HTTP_503_RETRY_DELAY_MS = 500;
+
+/**
+ * True only for "the server is overloaded right now": HTTP 503 with a
+ * cancellation/deadline that did NOT happen (`aborted`). A 503 whose drain was
+ * cut short by the deadline or the caller is not a trustworthy exchange and is
+ * never retried.
+ */
+export function isRetryable503(outcome: Pick<ExchangeOutcome, "ok" | "status" | "aborted">): boolean {
+	return !outcome.ok && outcome.status === HTTP_503_RETRY_STATUS && !outcome.aborted;
+}
+
+/**
+ * A promise that resolves after `ms`, or rejects with "cancelled" as soon as
+ * the signal aborts. The retry wait can never outlive a cancellation.
+ */
+export function sleepOrAbort(ms: number, signal: AbortSignal | undefined): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) {
+			reject(new Error("cancelled"));
+			return;
+		}
+		const timer = setTimeout(() => {
+			if (signal) signal.removeEventListener("abort", onAbort);
+			resolve();
+		}, Math.max(1, ms));
+		const onAbort = (): void => {
+			clearTimeout(timer);
+			reject(new Error("cancelled"));
+		};
+		if (signal) signal.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+export interface RetryBudgetInput {
+	/** The failed 503 exchange; its unknown cost is already counted by the caller. */
+	kind: AssessmentKind;
+	/** Attempts already dispatched for this assessment, always 1 here. */
+	attempts: number;
+}
+
 export interface HttpClientOptions {
 	endpoint: string;
 	model: string;
@@ -33,6 +82,13 @@ export interface HttpClientOptions {
 	fetchImpl?: typeof fetch;
 	/** Extra literal values to strip from anything we store (e.g. the key). */
 	secrets?: readonly string[];
+	/**
+	 * Optional gate for the single 503 retry. The client has no budget of its own:
+	 * the adapter owns the request cap and the monetary allowance, so it answers
+	 * whether a second dispatched request is affordable. `undefined` means "no
+	 * retry budget configured", and the retry is then never taken.
+	 */
+	retryBudget?: (input: RetryBudgetInput) => { allowed: boolean; reason?: string };
 }
 
 export interface RequestBuild {
@@ -187,6 +243,8 @@ function readCost(payload: Record<string, unknown>): CostInfo {
 }
 
 export interface ExchangeOutcome {
+	/** How many HTTP requests this exchange actually dispatched (1 or 0). */
+	attempts: number;
 	ok: boolean;
 	status: number | null;
 	bytes: number;
@@ -216,6 +274,8 @@ export async function postAssessment(options: {
 	const external = options.signal;
 	let timedOut = false;
 	let settled = false;
+	// 0 until a request is actually put on the wire.
+	let attempts = 0;
 
 	const onExternalAbort = (): void => {
 		if (!settled) {
@@ -224,7 +284,7 @@ export async function postAssessment(options: {
 	};
 	if (external) {
 		if (external.aborted) {
-			return { ok: false, status: null, bytes: 0, error: "cancelled before dispatch", timedOut: false, aborted: true };
+			return { attempts: 0, ok: false, status: null, bytes: 0, error: "cancelled before dispatch", timedOut: false, aborted: true };
 		}
 		external.addEventListener("abort", onExternalAbort, { once: true });
 	}
@@ -235,6 +295,7 @@ export async function postAssessment(options: {
 
 	const doFetch = options.fetchImpl ?? fetch;
 	try {
+		attempts = 1;
 		const response = await doFetch(options.endpoint, {
 			method: "POST",
 			headers: { "content-type": "application/json", accept: "application/json", authorization: `Bearer ${options.apiKey}` },
@@ -246,31 +307,32 @@ export async function postAssessment(options: {
 			// cancellation/deadline during the drain still means "no trustworthy exchange".
 			const drained = await readCapped(response, 8192, controller.signal).catch(() => undefined);
 			if (controller.signal.aborted) {
-				return { ok: false, status: response.status, bytes: 0, error: timedOut ? "deadline exceeded" : "cancelled", timedOut, aborted: true };
+				return { attempts, ok: false, status: response.status, bytes: 0, error: timedOut ? "deadline exceeded" : "cancelled", timedOut, aborted: true };
 			}
-			return { ok: false, status: response.status, bytes: 0, error: `HTTP ${response.status}`, responseText: drained?.text, timedOut, aborted: false };
+			return { attempts, ok: false, status: response.status, bytes: 0, error: `HTTP ${response.status}`, responseText: drained?.text, timedOut, aborted: false };
 		}
 		const read = await readCapped(response, options.maxResponseBytes, controller.signal);
 		// A cancellation or deadline at ANY point of the read, including one that
 		// made reader.cancel() resolve `done` over complete-looking partial bytes,
 		// can never produce a success path.
 		if (controller.signal.aborted) {
-			return { ok: false, status: response.status, bytes: read.bytes, error: timedOut ? "deadline exceeded" : "cancelled", timedOut, aborted: true };
+			return { attempts, ok: false, status: response.status, bytes: read.bytes, error: timedOut ? "deadline exceeded" : "cancelled", timedOut, aborted: true };
 		}
 		if (read.tooLarge) {
-			return { ok: false, status: response.status, bytes: read.bytes, error: `response exceeds ${options.maxResponseBytes} bytes`, timedOut, aborted: controller.signal.aborted };
+			return { attempts, ok: false, status: response.status, bytes: read.bytes, error: `response exceeds ${options.maxResponseBytes} bytes`, timedOut, aborted: controller.signal.aborted };
 		}
 		try {
 			const payload = JSON.parse(read.text) as unknown;
-			return { ok: true, status: response.status, bytes: read.bytes, payload, responseText: read.text, timedOut: false, aborted: false };
+			return { attempts, ok: true, status: response.status, bytes: read.bytes, payload, responseText: read.text, timedOut: false, aborted: false };
 		}
 		catch {
-			return { ok: false, status: response.status, bytes: read.bytes, error: "response body is not valid JSON", responseText: read.text.slice(0, 8192), timedOut, aborted: false };
+			return { attempts, ok: false, status: response.status, bytes: read.bytes, error: "response body is not valid JSON", responseText: read.text.slice(0, 8192), timedOut, aborted: false };
 		}
 	}
 	catch (error) {
 		const aborted = controller.signal.aborted || (error as { name?: string })?.name === "AbortError";
 		return {
+			attempts,
 			ok: false,
 			status: null,
 			bytes: 0,
@@ -416,28 +478,74 @@ export function createHttpClient(options: HttpClientOptions): JevClient {
 					origin: "live",
 				});
 			}
-
-			const exchange = await postAssessment({
+			// --- dispatch, with the ONE 503 retry -------------------------------------
+			// Every failure except a clean HTTP 503 is final. A 503 is retried at most
+			// once, after 500ms, inside the same total deadline and abort signal, and
+			// only when the caller's retry budget allows another dispatched request.
+			// The retry's own outcome is never retried again.
+			const dispatch = (remainingMs: number): Promise<ExchangeOutcome> => postAssessment({
 				endpoint: options.endpoint,
 				apiKey,
 				body: requestBody,
-				deadlineMs,
+				deadlineMs: remainingMs,
 				maxResponseBytes: options.maxResponseBytes,
 				signal,
 				fetchImpl: options.fetchImpl,
 			});
+
+			let exchange = await dispatch(deadlineMs);
+			let attempts = exchange.attempts;
+			let retryNote: string | null = null;
+			if (!exchange.ok && isRetryable503(exchange)) {
+				// The failed attempt's cost is unknown and stays unknown; the caller's
+				// reservation for it stays armed. This asks for room for ONE more.
+				const budget = options.retryBudget?.({ kind, attempts });
+				if (!budget?.allowed) {
+					retryNote = `http 503: no retry (${budget?.reason ?? "retry budget not configured"})`;
+				}
+				else {
+					const remaining = deadlineMs - Math.round(performance.now() - start);
+					if (remaining <= HTTP_503_RETRY_DELAY_MS) {
+						// A retry could not fit inside the original total deadline.
+						retryNote = `http 503: no retry (deadline has ${Math.max(0, remaining)}ms left, below the ${HTTP_503_RETRY_DELAY_MS}ms retry wait)`;
+					}
+					else {
+						try {
+							await sleepOrAbort(HTTP_503_RETRY_DELAY_MS, signal);
+							// Recompute AFTER the wait: `remaining` is the pre-wait value,
+							// and dispatching with it would stretch the deadline by the wait.
+							const remainingAfterWait = deadlineMs - Math.round(performance.now() - start);
+							if (remainingAfterWait <= 0) {
+								// The wait ate the whole deadline: no second request goes out.
+								retryNote = `http 503: retry skipped (deadline exhausted during the ${HTTP_503_RETRY_DELAY_MS}ms wait)`;
+							}
+							else {
+								const retry = await dispatch(remainingAfterWait);
+								attempts += retry.attempts;
+								exchange = retry;
+								retryNote = retry.ok ? `http 503 retried once after ${HTTP_503_RETRY_DELAY_MS}ms: succeeded` : `http 503 retried once after ${HTTP_503_RETRY_DELAY_MS}ms: ${retry.error ?? "still failing"}`;
+							}
+						}
+						catch {
+							// Cancelled during the wait: no second request was dispatched.
+							retryNote = `http 503: retry cancelled during the ${HTTP_503_RETRY_DELAY_MS}ms wait`;
+						}
+					}
+				}
+			}
 			const artifact = responseArtifact(exchange);
 
 			if (!exchange.ok) {
+				const transportNote = scrub([exchange.error ?? "request failed", retryNote].filter(Boolean).join("; "));
 				return finish({
 					ok: false,
 					status: "UNCHECKED",
 					answers: {},
 					findings: [],
-					notes: exchange.error ?? "request failed",
-					failure: { stage: "transport", message: scrub(exchange.error ?? "request failed") },
+					notes: transportNote,
+					failure: { stage: "transport", message: transportNote },
 					cost: { billedUsd: null, marketUsd: null, unknown: true },
-					usage: { requestBytes: built.bytes, responseBytes: exchange.bytes, attempts: 1 },
+					usage: { requestBytes: built.bytes, responseBytes: exchange.bytes, attempts },
 					requestId,
 					requestHash,
 					requestBody,
@@ -457,7 +565,7 @@ export function createHttpClient(options: HttpClientOptions): JevClient {
 					notes: scrub(validated.problems.join("; ")),
 					failure: { stage: "validation", message: scrub(validated.problems.join("; ")) },
 					cost: validated.cost,
-					usage: { requestBytes: built.bytes, responseBytes: exchange.bytes, attempts: 1 },
+					usage: { requestBytes: built.bytes, responseBytes: exchange.bytes, attempts },
 					requestId,
 					requestHash,
 					requestBody,
@@ -473,9 +581,11 @@ export function createHttpClient(options: HttpClientOptions): JevClient {
 				status: "UNCHECKED",
 				answers: validated.answers,
 				findings: [],
-				notes: validated.providerId ? scrub(`provider id ${validated.providerId}`) : "",
+				// A 503 that a retry rescued is still worth saying so: the attempt count
+				// is 2 and the first failure is not hidden.
+				notes: scrub([validated.providerId ? `provider id ${validated.providerId}` : "", retryNote].filter(Boolean).join("; ")),
 				cost: validated.cost,
-				usage: { requestBytes: built.bytes, responseBytes: exchange.bytes, attempts: 1 },
+				usage: { requestBytes: built.bytes, responseBytes: exchange.bytes, attempts },
 				requestId,
 				requestHash,
 				requestBody,

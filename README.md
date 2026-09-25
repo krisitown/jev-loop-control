@@ -4,7 +4,7 @@ Pi extension that supervises actor direction and completion with bounded Jev ass
 
 Jev checks the actor's proposed tools and completion status, applying bounded interventions when necessary. It works alongside the actor model you already use in Pi: **your configured Pi model stays the actor.** This version does not change that.
 
-**Version:** 0.3.1 (candidate) · See [CHANGELOG.md](CHANGELOG.md).
+**Version:** 0.3.2 (candidate) · See [CHANGELOG.md](CHANGELOG.md).
 
 Jev supervises and, in `enforce`, redirects work that its evidence does not support. Whether that improves your outcomes is yours to measure: this project makes no proven-effectiveness claim, and traces plus statuses are written so you can check each decision yourself.
 
@@ -78,7 +78,7 @@ The extension automatically discovers `jev-loop-control.config.json` in the curr
 | `limits.proposalLease` | `2` | Proposals a recovery objective stays attached to. |
 | `jev.maxRequestBytes` | `131072` | Local transport guard, not a provider limit. |
 | `jev.maxResponseBytes` | `262144` | Response size guard. |
-| `jev.deadlineMs` | `5000` | Wall-clock deadline per assessment. No retries. |
+| `jev.deadlineMs` | `5000` | Wall-clock deadline per assessment. Retries HTTP 503 once after 500ms within the deadline. |
 
 ### Existing Configs
 
@@ -121,6 +121,10 @@ Your configured Pi model remains the actor. A bounded snapshot of the task traje
 
 `jev.maxRequestBytes` (default `131072`) is a **local** ceiling on what this client will put on the wire. It is not an assertion about any provider's own limit, and raising it buys no extra provider allowance. A request above the guard is reported as a transport failure and the proposal passes through unassessed; there is no retry. Lower it if you want smaller outbound requests, raise it only if you have confirmed your endpoint accepts them.
 
+### HTTP 503 Retry
+
+Exactly one failure mode is ever retried: an HTTP **503** whose response drained without the deadline or a cancellation firing. After a fixed **500 ms** wait, one second request goes out — inside the same total `jev.deadlineMs`, never a second one after that, and never for any other status, an invalid body, a transport error, a deadline, or a cancellation. If the retry succeeds, the assessment succeeds with `attempts: 2` and a trace note (`http 503 retried once after 500ms: succeeded`); the first failure is not hidden. The retry spends from the same `budget.maxRequests` and `budget.allowanceUsd` as any other request (checked at retry time), but it is **one assessment, not two**. The failed 503's cost stays unknown and its reservation stays armed even when the retry reports a known cost, so `unknownCosts` and `reservedUsd` in `/jev-status` and `summary.json` stay honest.
+
 ### Optional Budget Limits
 
 To limit costs, add a `budget` section to your config:
@@ -135,7 +139,7 @@ To limit costs, add a `budget` section to your config:
 }
 ```
 
-- `maxRequests`: Hard cap on dispatched requests. `null` or omitted means unlimited. `0` stops all calls.
+- `maxRequests`: Hard cap on dispatched requests, including the single 503 retry. `null` or omitted means unlimited. `0` stops all calls.
 - `allowanceUsd`: Spending allowance in USD. `null` or omitted means unlimited. `0` stops all calls.
 - `reserveUsdPerRequest`: Conservative reservation per request when cost is unknown. This is an estimate, not a billing guarantee.
 
@@ -191,7 +195,7 @@ Status values:
 - **UNCHECKED**: Assessment unavailable or skipped; not a success verdict.
 - **COMPLETE**: All requirements strongly supported and final claims supported.
 
-Failed or weak assessments do not cause intervention. HTTP requests have no automatic retries. Request/assessment limits apply per session; intervention limits per task.
+Failed or weak assessments do not cause intervention. HTTP requests retry 503 once after 500ms within the deadline; other failures are not retried. Request/assessment limits apply per session; intervention limits per task.
 
 ## Task Manifest
 

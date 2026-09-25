@@ -5,7 +5,38 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
-## 0.3.1 - Current candidate
+## 0.3.2 - Current candidate
+
+Patch on top of 0.3.1.
+
+### Added
+
+- Single HTTP 503 retry: an overloaded-server response (503, with no deadline or
+  cancellation firing during its drain) is retried exactly once after 500 ms,
+  inside the same total `jev.deadlineMs` and abort signal. No other failure is
+  ever retried. The retry's outcome is never retried again.
+- The retry is gated by the adapter's real budget at retry time: it must clear
+  `budget.maxRequests` and `budget.allowanceUsd`, but never
+  `limits.maxAssessments`, because a retry is one extra *request*, not a second
+  *assessment*. With no retry budget wired, the retry is never taken.
+- Honest accounting: the retry raises the dispatched-request count, the failed
+  503's cost stays unknown and its reservation stays armed even when the retry
+  reports a known cost, and the trace records `assessment.retry` plus a
+  `http 503 retried once after 500ms[: ...]` note. Successes and refusals are
+  both visible; nothing is silently swallowed.
+
+### Testing
+
+- Offline only. Transport-level retry tests (statuses, deadline, cancellation,
+  gate inputs, artifacts) plus end-to-end accounting through the real
+  `liveObserve`/`createHttpClient` wiring with a scripted fetch: 503-then-200
+  ends at 2 requests / 1 assessment / billed 0.05 / 1 unknown / 0.01 reserved;
+  503 twice ends at 2 unknowns / 0.02 reserved; `maxRequests: 1` denies the
+  retry at the production gate, `maxRequests: 2` allows it. Suite green at this
+  commit via `npm run check`. No live endpoint was contacted; the retry's real-
+  world behaviour against the actual provider remains to be measured.
+
+## 0.3.1 - Previous candidate
 
 Patch on top of the 0.3.0 development milestone (`5b83579`, 153 tests passing).
 

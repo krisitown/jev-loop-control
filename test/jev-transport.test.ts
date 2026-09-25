@@ -1,12 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildRequestBody, createHttpClient, postAssessment, validateResponse, PROBABILITY_SUM_TOLERANCE } from "../src/jev.ts";
+import { buildRequestBody, createHttpClient, isRetryable503, postAssessment, sleepOrAbort, validateResponse, HTTP_503_RETRY_DELAY_MS, HTTP_503_RETRY_STATUS, PROBABILITY_SUM_TOLERANCE } from "../src/jev.ts";
 import { hashBytes } from "../src/redact.ts";
 import type { Question } from "../src/types.ts";
 
 /**
  * Transport and answer-validation regressions. One POST, a total deadline, a
- * capped body, zero retries, and strict TypeSafe-compatible answer shapes:
+ * capped body, and strict TypeSafe-compatible answer shapes. The ONLY retry is
+ * one extra POST after a clean HTTP 503, 500ms later, inside the same deadline
+ * and abort signal; nothing else is ever retried:
  * choice -> {type:"choice",choice,probabilities,confidence}; noul -> {type:
  * "noul", noul} where noul is the probability of YES.
  */
@@ -132,7 +134,8 @@ test("postAssessment: exactly one POST, bounded bytes, no retries", async () => 
 	}) as unknown as typeof fetch;
 	const outcome = await postAssessment({ endpoint: "https://example.test/v1", apiKey: "k", body: "{}", deadlineMs: 2000, maxResponseBytes: 1024, signal: undefined, fetchImpl });
 	assert.ok(outcome.ok);
-	assert.equal(calls, 1, "one dispatched request per assessment");
+	assert.equal(calls, 1, "one dispatched request per attempt");
+	assert.equal(outcome.attempts, 1, "postAssessment itself never repeats: the single 503 retry lives in the client");
 });
 
 test("postAssessment: a response over the byte cap fails the assessment, it is not trimmed", async () => {
@@ -289,4 +292,241 @@ test("client: zero requests and zero attempts when the key is missing or the req
 	const a2 = await tiny.assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state: { huge: "y".repeat(4000) }, signal: undefined, deadlineMs: 1000 });
 	assert.ok(!a2.ok && a2.usage.attempts === 0 && calls === 0, "an oversized request is never dispatched");
 	assert.equal(a2.usage.requestBytes > 1024, true);
+});
+
+// ---------------------------------------------------------------- 503 retry
+
+/**
+ * The one retry this client is allowed to make: an HTTP 503 costs at most TWO
+ * dispatched requests, 500ms apart, inside the same total deadline and the same
+ * abort signal. Every other failure is final.
+ */
+
+/** Scratch client: only the retry budget and the deadline vary per test. */
+function retryClient(fetchImpl: typeof fetch, extra: { deadlineMs?: number; secrets?: readonly string[]; retryBudget?: (input: { kind: string; attempts: number }) => { allowed: boolean; reason?: string } } = {}) {
+	return createHttpClient({
+		endpoint: "https://example.test/v1",
+		model: "typesafe-ai/jev",
+		apiKeyEnv: "TEST_JEV_KEY",
+		deadlineMs: extra.deadlineMs ?? 4000,
+		maxRequestBytes: 49_152,
+		maxResponseBytes: 262_144,
+		env: { TEST_JEV_KEY: "key-value-8899" },
+		fetchImpl,
+		...(extra.secrets ? { secrets: extra.secrets } : {}),
+		...(extra.retryBudget ? { retryBudget: extra.retryBudget as never } : {}),
+	});
+}
+
+const allowRetry = () => ({ allowed: true });
+const refuseRetry = (reason: string) => () => ({ allowed: false, reason });
+
+function statusResponse(status: number, body: unknown = {}): Response {
+	return new Response(JSON.stringify(body), { status });
+}
+
+/** Scripted responses, consumed one per dispatched request. */
+function scripted(responses: Array<number | Response | (() => Response)>): { fetchImpl: typeof fetch; bodies: string[] } {
+	const state = { index: 0 };
+	const bodies: string[] = [];
+	const fetchImpl = (async (_url: unknown, init: unknown) => {
+		bodies.push(String((init as { body: string }).body));
+		const next = responses[Math.min(state.index, responses.length - 1)] ?? responses.at(-1)!;
+		state.index += 1;
+		return typeof next === "function" ? next() : typeof next === "number" ? statusResponse(next, GOOD_ANSWERS) : next;
+	}) as unknown as typeof fetch;
+	return { fetchImpl, bodies };
+}
+
+test("retry: HTTP 503 then 200 succeeds with usage.attempts 2 and a visible retry note", { timeout: 5000 }, async () => {
+	const { fetchImpl, bodies } = scripted([503, () => statusResponse(200, { answers: GOOD_ANSWERS, id: "req-2" })]);
+	const assessment = await retryClient(fetchImpl, { retryBudget: allowRetry }).assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state: {}, signal: undefined, deadlineMs: 4000 });
+	assert.ok(assessment.ok, JSON.stringify(assessment.failure));
+	assert.equal(assessment.usage.attempts, 2, "the 503 plus one retry, never more");
+	assert.match(assessment.notes, /http 503 retried once after 500ms: succeeded/);
+	assert.equal(bodies.length, 2);
+	assert.equal(bodies[0], bodies[1], "the retry sends the identical body: same questions, same state, same encoding");
+});
+
+test("retry: HTTP 503 twice stops at exactly two requests and does not hide the failure", { timeout: 5000 }, async () => {
+	let calls = 0;
+	const fetchImpl = (async () => { calls += 1; return statusResponse(HTTP_503_RETRY_STATUS, {}); }) as unknown as typeof fetch;
+	const assessment = await retryClient(fetchImpl, { retryBudget: allowRetry }).assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state: {}, signal: undefined, deadlineMs: 4000 });
+	assert.equal(calls, 2, "exactly one retry, then it gives up");
+	assert.ok(!assessment.ok);
+	assert.equal(assessment.usage.attempts, 2);
+	assert.equal(assessment.failure?.stage, "transport");
+	assert.match(assessment.failure?.message ?? "", /HTTP 503/);
+	assert.match(assessment.failure?.message ?? "", /http 503 retried once after 500ms: HTTP 503/);
+	// Two dispatched requests, neither of which reported a charge: both unknown.
+	assert.deepEqual([assessment.cost.billedUsd, assessment.cost.unknown], [null, true]);
+});
+
+test("retry: the wait is ~500ms and the retry stays inside the ORIGINAL deadline", { timeout: 5000 }, async () => {
+	const { fetchImpl, bodies } = scripted([503, () => statusResponse(200, { answers: GOOD_ANSWERS })]);
+	const started = performance.now();
+	const assessment = await retryClient(fetchImpl, { retryBudget: allowRetry }).assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state: {}, signal: undefined, deadlineMs: 4000 });
+	const elapsed = performance.now() - started;
+	assert.ok(assessment.ok);
+	assert.equal(assessment.usage.attempts, 2);
+	assert.ok(elapsed >= HTTP_503_RETRY_DELAY_MS, `waited ${elapsed.toFixed(0)}ms, expected at least ${HTTP_503_RETRY_DELAY_MS}ms`);
+	assert.ok(elapsed < 3000, `the retry stayed inside the original 4000ms deadline (took ${elapsed.toFixed(0)}ms)`);
+	assert.ok(assessment.timings.ms < 4000, "the recorded time is the whole exchange, not just the last attempt");
+});
+
+test("retry: only 503 retries; every other status, invalid body, or transport failure is final", { timeout: 5000 }, async () => {
+	const cases: Array<[number | "json" | "throw", Response]> = [
+		[400, statusResponse(400, {})],
+		[408, statusResponse(408, {})],
+		[429, statusResponse(429, {})],
+		[500, statusResponse(500, {})],
+		[502, statusResponse(502, {})],
+		[504, statusResponse(504, {})],
+	];
+	for (const [label, response] of cases) {
+		let calls = 0;
+		const fetchImpl = (async () => { calls += 1; return response; }) as unknown as typeof fetch;
+		const assessment = await retryClient(fetchImpl, { retryBudget: allowRetry }).assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state: {}, signal: undefined, deadlineMs: 2000 });
+		assert.equal(calls, 1, `HTTP ${label} must not be retried`);
+		assert.equal(assessment.usage.attempts, 1);
+		assert.ok(!assessment.ok);
+		assert.ok(!JSON.stringify(assessment).includes("http 503"), `no retry talk on HTTP ${label}`);
+	}
+
+	// A 200 whose body is not JSON is an invalid response, not an overload.
+	let jsonCalls = 0;
+	const badJson = (async () => { jsonCalls += 1; return new Response("{ not json", { status: 200 }); }) as unknown as typeof fetch;
+	const jsonAssessment = await retryClient(badJson, { retryBudget: allowRetry }).assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state: {}, signal: undefined, deadlineMs: 2000 });
+	assert.equal(jsonCalls, 1, "an undecodable body is never retried");
+	assert.equal(jsonAssessment.usage.attempts, 1);
+
+	// A transport error is final too.
+	let throwCalls = 0;
+	const throws = (async () => { throwCalls += 1; throw new Error("connection reset"); }) as unknown as typeof fetch;
+	const transport = await retryClient(throws, { retryBudget: allowRetry }).assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state: {}, signal: undefined, deadlineMs: 2000 });
+	assert.equal(throwCalls, 1, "a transport error is never retried");
+	assert.equal(transport.usage.attempts, 1);
+
+	// A 200 that fails validation is an answer problem, not an overloaded server.
+	let validationCalls = 0;
+	const invalid = (async () => { validationCalls += 1; return statusResponse(200, { answers: {} }); }) as unknown as typeof fetch;
+	const invalidAssessment = await retryClient(invalid, { retryBudget: allowRetry }).assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state: {}, signal: undefined, deadlineMs: 2000 });
+	assert.equal(validationCalls, 1, "an invalid answer set is never retried");
+	assert.equal(invalidAssessment.usage.attempts, 1);
+	assert.equal(invalidAssessment.failure?.stage, "validation");
+});
+
+test("retry: a 503 whose drain was cut by the deadline is not retried, and no second request happens after the deadline", { timeout: 5000 }, async () => {
+	let calls = 0;
+	const fetchImpl = (async () => {
+		calls += 1;
+		return new Response(new ReadableStream({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode("x".repeat(4096)));
+				// never closes: the drain is still running when the deadline hits
+			},
+		}), { status: HTTP_503_RETRY_STATUS });
+	}) as unknown as typeof fetch;
+	const assessment = await retryClient(fetchImpl, { retryBudget: allowRetry, deadlineMs: 80 }).assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state: {}, signal: undefined, deadlineMs: 80 });
+	assert.equal(calls, 1, "an aborted 503 exchange is not a clean 'overloaded' signal, and the deadline leaves no room anyway");
+	assert.ok(!assessment.ok);
+	assert.equal(assessment.usage.attempts, 1);
+	assert.equal(isRetryable503({ ok: false, status: HTTP_503_RETRY_STATUS, aborted: true }), false);
+});
+
+test("retry: cancellation during the 500ms wait dispatches NOTHING and settles promptly", { timeout: 2000 }, async () => {
+	let calls = 0;
+	const fetchImpl = (async () => { calls += 1; return statusResponse(HTTP_503_RETRY_STATUS, {}); }) as unknown as typeof fetch;
+	const ac = new AbortController();
+	const started = performance.now();
+	const assessment = await retryClient(fetchImpl, { retryBudget: allowRetry }).assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state: {}, signal: ac.signal, deadlineMs: 60_000 });
+	const wait = new Promise<void>((resolve) => setTimeout(resolve, 20));
+	await wait;
+	ac.abort();
+	const first = performance.now();
+	// Second assessment: aborted BEFORE dispatch, so nothing is sent at all.
+	const aborted = await retryClient(fetchImpl, { retryBudget: allowRetry }).assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state: {}, signal: ac.signal, deadlineMs: 60_000 });
+	const elapsed = performance.now() - first;
+	assert.ok(calls >= 1 && calls <= 2, `only the first attempt dispatched (${calls} calls)`);
+	assert.equal(aborted.usage.attempts, 0, "a cancelled caller dispatches nothing");
+	assert.ok(elapsed < 200, `a pre-aborted caller settles immediately (${elapsed.toFixed(0)}ms)`);
+	assert.ok(!aborted.ok && /cancelled/.test(aborted.failure?.message ?? ""));
+	assert.ok(started < first);
+});
+
+test("retry: sleepOrAbort resolves after the wait and rejects immediately when the signal is already aborted", async () => {
+	const started = performance.now();
+	await sleepOrAbort(30, undefined);
+	assert.ok(performance.now() - started >= 25);
+	const ac = new AbortController();
+	ac.abort();
+	await assert.rejects(sleepOrAbort(5000, ac.signal), /cancelled/);
+});
+
+test("retry: the retry budget decides, so maxRequests 1 denies and maxRequests 2 allows", { timeout: 5000 }, async () => {
+	// Denied: the caller's request cap is already spent by this assessment.
+	let deniedCalls = 0;
+	const deniedFetch = (async () => { deniedCalls += 1; return statusResponse(HTTP_503_RETRY_STATUS, {}); }) as unknown as typeof fetch;
+	const denied = await retryClient(deniedFetch, { retryBudget: refuseRetry("request cap reached (1/1)") }).assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state: {}, signal: undefined, deadlineMs: 4000 });
+	assert.equal(deniedCalls, 1, "no second request when the budget says no");
+	assert.ok(!denied.ok);
+	assert.equal(denied.usage.attempts, 1);
+	assert.match(denied.failure?.message ?? "", /http 503: no retry \(request cap reached \(1\/1\)\)/);
+
+	// The budget is asked, not assumed: it sees the attempt count of this assessment.
+	const seen: Array<{ kind: string; attempts: number }> = [];
+	const probing = (async (_url: unknown, _init: unknown) => {
+		return statusResponse(HTTP_503_RETRY_STATUS, {});
+	}) as unknown as typeof fetch;
+	await retryClient(probing, {
+		retryBudget: (input) => {
+			seen.push(input);
+			return { allowed: true };
+		},
+	}).assess({ kind: "completion", snapshot: SNAPSHOT as never, questions: QUESTIONS, state: {}, signal: undefined, deadlineMs: 4000 });
+	assert.deepEqual(seen, [{ kind: "completion", attempts: 1 }], "asked exactly once, for the one extra request");
+
+	// No budget wired in at all: the conservative answer is "no retry".
+	let silentCalls = 0;
+	const silentFetch = (async () => { silentCalls += 1; return statusResponse(HTTP_503_RETRY_STATUS, {}); }) as unknown as typeof fetch;
+	const silent = await retryClient(silentFetch).assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state: {}, signal: undefined, deadlineMs: 4000 });
+	assert.equal(silentCalls, 1, "a client with no retry budget never retries on its own");
+	assert.equal(silent.usage.attempts, 1);
+	assert.match(silent.failure?.message ?? "", /retry budget not configured/);
+});
+
+test("retry: a missing API key is never retried and never dispatched", async () => {
+	let calls = 0;
+	const fetchImpl = (async () => { calls += 1; return statusResponse(HTTP_503_RETRY_STATUS, {}); }) as unknown as typeof fetch;
+	const noKey = createHttpClient({ endpoint: "https://x.test", model: "m", apiKeyEnv: "ABSENT_KEY", deadlineMs: 1000, maxRequestBytes: 100_000, maxResponseBytes: 1000, env: {}, fetchImpl, retryBudget: allowRetry });
+	const assessment = await noKey.assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state: {}, signal: undefined, deadlineMs: 1000 });
+	assert.equal(calls, 0);
+	assert.equal(assessment.usage.attempts, 0);
+	assert.ok(!assessment.ok && !JSON.stringify(assessment).includes("http 503"));
+});
+
+test("retry: 503 bytes and artifacts describe the LAST attempt, and neither echoes the key", async () => {
+	const secret = "key-value-8899";
+	let calls = 0;
+	const fetchImpl = (async () => {
+		calls += 1;
+		return calls === 1 ? statusResponse(HTTP_503_RETRY_STATUS, {}) : statusResponse(200, { answers: GOOD_ANSWERS, cost: { billed_usd: 0.02 }, id: `req-${calls}` });
+	}) as unknown as typeof fetch;
+	const assessment = await retryClient(fetchImpl, { retryBudget: allowRetry, secrets: [secret] }).assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state: { note: `the key is ${secret}` }, signal: undefined, deadlineMs: 4000 });
+	assert.ok(assessment.ok);
+	assert.equal(assessment.usage.attempts, 2);
+	assert.equal(assessment.usage.requestBytes, Buffer.byteLength(assessment.requestBody!, "utf8"), "requestBytes counts the body that was sent, not attempts x body");
+	assert.equal(assessment.responseHash, hashBytes(assessment.responseBody!), "the stored response is the bytes of the attempt that settled the exchange");
+	assert.ok(assessment.responseBody!.includes("PROCEED"));
+	assert.ok(!JSON.stringify(assessment).includes(secret));
+});
+
+test("retry: HTTP_503_RETRY_* constants keep the policy honest", () => {
+	assert.equal(HTTP_503_RETRY_STATUS, 503);
+	assert.equal(HTTP_503_RETRY_DELAY_MS, 500);
+	assert.equal(isRetryable503({ ok: false, status: 503, aborted: false }), true);
+	assert.equal(isRetryable503({ ok: false, status: 500, aborted: false }), false);
+	assert.equal(isRetryable503({ ok: false, status: null, aborted: false }), false);
+	assert.equal(isRetryable503({ ok: false, status: 503, aborted: true }), false);
+	assert.equal(isRetryable503({ ok: true, status: 200, aborted: false }), false);
 });

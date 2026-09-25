@@ -8,9 +8,9 @@ import { buildQuestions, buildState } from "./questions.ts";
 import { decideDirection, decideCompletion } from "./policy.ts";
 import { TraceStore, defaultRunsDir, runId } from "./trace.ts";
 import { makeScrub, redactValue } from "./redact.ts";
-import type { Assessment, BudgetState, Decision, EvidenceSnapshot, Question, JevClient } from "./types.ts";
+import type { Assessment, AssessmentKind, BudgetState, Decision, EvidenceSnapshot, Question, JevClient } from "./types.ts";
 import { applyCompletionContinuation, applyDirectionBlock } from "./interventions.ts";
-import { assessmentBudgetReason } from "./budget.ts";
+import { assessmentBudgetReason, retryRequestBudget } from "./budget.ts";
 import type { ToolCallEventResult, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import { createRecovery, advanceRecovery, recoveryInstruction, beginRecovery, recoveryEvidenceKey, type RecoveryState, type RecoveryMode } from "./recovery.ts";
 
@@ -63,7 +63,7 @@ interface LiveState {
 /** Our own injected guidance message; the context hook drops nothing else. */
 const GUIDANCE_CUSTOM_TYPE = "jev-loop-control.recovery-guidance";
 
-export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClient }): void {
+export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClient; fetchImpl?: typeof fetch }): void {
 	let state: LiveState | undefined;
 	let activation = { reason: "session not started", configPath: "", cwd: "", mode: "off", enabled: false, hint: "apiKeyEnv must name an environment variable such as AI_GATEWAY_API_KEY. Export that variable before launching Pi; restart after environment changes." };
 	let activationScrub = makeScrub([]);
@@ -116,14 +116,28 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 		const traceDir = config.trace.dir ? join(config.trace.dir, runIdStr) : defaultRunsDir(agentDir, runIdStr);
 		const trace = new TraceStore({ dir: traceDir, artifacts: config.trace.artifacts, runId: runIdStr, scrub: makeScrub([apiKey]) });
 
+		// The live client is built before the session state exists, so the retry
+		// budget reads this shared object: the adapter mutates it in place, and the
+		// transport sees the counts as they are at the moment a 503 arrives.
+		const budgetProbe: BudgetState = { requestsUsed: 0, reservedUsd: 0, billedUsd: 0, marketUsd: 0, unknownCosts: 0 };
+
 		const client = dependencies?.client ?? createHttpClient({
 			endpoint: config.jev.endpoint,
+			// Tests script the wire here; production leaves it undefined and uses fetch.
+			...(dependencies?.fetchImpl ? { fetchImpl: dependencies.fetchImpl } : {}),
 			model: config.jev.model,
 			apiKeyEnv: config.jev.apiKeyEnv,
 			deadlineMs: config.jev.deadlineMs,
 			maxRequestBytes: config.jev.maxRequestBytes,
 			maxResponseBytes: config.jev.maxResponseBytes,
 			secrets: [apiKey],
+			// With a scripted fetch the key never belongs in the real environment, so
+			// the client gets its own env copy; production keeps reading process.env.
+			...(dependencies?.fetchImpl ? { env: { ...process.env, [config.jev.apiKeyEnv]: apiKey } } : {}),
+			// The one HTTP 503 retry spends from the same caps as any request, and
+			// this is read at retry time, so `budget.maxRequests` really does decide
+			// whether the second request goes out.
+			retryBudget: () => retryRequestBudget(config, budgetProbe),
 		});
 
 		state = {
@@ -133,7 +147,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			client,
 			messages: [],
 			executedIds: new Set(),
-			budget: { requestsUsed: 0, reservedUsd: 0, billedUsd: 0, marketUsd: 0, unknownCosts: 0 },
+			budget: budgetProbe,
 			assessmentsUsed: 0,
 			interventionsUsed: 0,
 			terminalContinuationsUsed: 0,
@@ -352,6 +366,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 				s.budget.unknownCosts++;
 			}
 			if (a.cost.marketUsd !== null) s.budget.marketUsd += a.cost.marketUsd;
+			accountRetryRequests(s, a, "direction");
 
 			const requestPath = a.requestBody !== undefined ? s.trace.artifact("request", a.requestBody, a.requestId) : null;
 			const responsePath = a.responseBody !== undefined ? s.trace.artifact("response", a.responseBody, a.requestId) : null;
@@ -369,6 +384,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			}
 			s.trace.record("direction_assessment", {
 				ok: a.ok,
+				retry: retryOutcomeNote(a),
 				answers: a.answers,
 				failure: a.failure,
 				usage: a.usage,
@@ -475,6 +491,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 						s.budget.unknownCosts++;
 					}
 					if (a.cost.marketUsd !== null) s.budget.marketUsd += a.cost.marketUsd;
+					accountRetryRequests(s, a, "completion");
 
 					const requestPath = a.requestBody !== undefined ? s.trace.artifact("request", a.requestBody, a.requestId) : null;
 					const responsePath = a.responseBody !== undefined ? s.trace.artifact("response", a.responseBody, a.requestId) : null;
@@ -492,6 +509,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 					}
 					s.trace.record("completion_assessment", {
 						ok: a.ok,
+						retry: retryOutcomeNote(a),
 						answers: a.answers,
 						failure: a.failure,
 						usage: a.usage,
@@ -696,6 +714,42 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			else console.error(scrubbed);
 		},
 	});
+
+	/**
+	 * A 503 retry inside one assessment is ONE assessment, not two: the adapter
+	 * already counted and reserved for the assessment, and the failed first request
+	 * left an unknown cost that stays unknown. What the adapter owes is the honest
+	 * REQUEST count for the second dispatch, so a retry can never hide from
+	 * `budget.maxRequests`, and it never counts as another assessment.
+	 */
+	function accountRetryRequests(s: LiveState, a: Assessment, kind: AssessmentKind): void {
+		const extra = a.usage.attempts - 1;
+		if (extra <= 0) return;
+		s.budget.requestsUsed += extra;
+		// The FIRST 503's cost is always unknown, regardless of what the retry
+		// finally reports: the first request was reserved, and a settled final cost
+		// only settles that one reservation. So each extra dispatch arms its own
+		// reservation and stays an unknown cost, even on a known-cost success.
+		s.budget.reservedUsd += s.config.budget.reserveUsdPerRequest * extra;
+		s.budget.unknownCosts += extra;
+		s.trace.record("assessment.retry", {
+			kind,
+			extraRequests: extra,
+			attempts: a.usage.attempts,
+			unknownCosts: extra,
+			reservedUsd: s.config.budget.reserveUsdPerRequest * extra,
+			requestId: a.requestId,
+			note: retryOutcomeNote(a),
+			counters: { requests: s.budget.requestsUsed, assessments: s.assessmentsUsed },
+		});
+	}
+
+	/** The retry status the transport reported, or null when there was no 503. */
+	function retryOutcomeNote(a: Assessment): string | null {
+		const message = `${a.notes ?? ""} ${a.failure?.message ?? ""}`;
+		const match = /(http 503[^;]*)/.exec(message);
+		return match ? match[1]!.trim() : null;
+	}
 
 	function applyToolCallDecision(s: LiveState, decision: Decision | undefined, event: ToolCallEvent, ctx: ExtensionContext): ToolCallEventResult | undefined {
 		if (s.batchBlocked && s.config.mode === "enforce" && s.trace.enabled && !ctx.signal?.aborted) {
