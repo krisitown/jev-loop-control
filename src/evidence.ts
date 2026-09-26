@@ -57,6 +57,8 @@ export interface PriorIntervention {
 	kind: string;
 	at: string;
 	focus: string;
+	/** `resolved` only after a grounded RESOLVED outcome; absence means open (expiry included). */
+	status?: "open" | "resolved";
 }
 
 /** Option ids that a requirement id must never be allowed to impersonate. */
@@ -573,7 +575,7 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 	const history = boundHistory(historyTurns, historyBudget);
 	const toolCalls = snapshotToolCalls(input.target, scrub);
 	const facts = deterministicFacts(input.messages, input.executedToolCallIds, scrub);
-	const priorInterventions = input.priorInterventions.slice(-5).map((entry) => ({ kind: scrub(entry.kind), at: entry.at, focus: scrub(entry.focus) }));
+	const priorInterventions = input.priorInterventions.slice(-5).map((entry) => ({ kind: scrub(entry.kind), at: entry.at, focus: scrub(entry.focus), ...(entry.status === "resolved" ? { status: "resolved" as const } : {}) }));
 
 	// One canonical representation: hashed for identity and rendered into the
 	// request. The hash and the request bytes can therefore never diverge.

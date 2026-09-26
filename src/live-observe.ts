@@ -12,7 +12,7 @@ import type { Assessment, AssessmentKind, BudgetState, Decision, EvidenceSnapsho
 import { applyCompletionContinuation, applyDirectionBlock } from "./interventions.ts";
 import { assessmentBudgetReason, retryRequestBudget, retryRequestBudgetReason } from "./budget.ts";
 import type { ToolCallEventResult, ToolCallEvent } from "@earendil-works/pi-coding-agent";
-import { createRecovery, advanceRecovery, recoveryInstruction, beginRecovery, recoveryEvidenceKey, type RecoveryState, type RecoveryMode } from "./recovery.ts";
+import { createRecovery, advanceRecovery, recoveryInstruction, beginRecovery, openConcernKey, resolveConcern, recoveryEvidenceKey, type RecoveryState, type RecoveryMode } from "./recovery.ts";
 import { buildAssessmentPacket, buildCompletionQuestions, buildCorrectionQuestions, decideCorrectionAssessment, decideTunedCompletion, ledgerFromSnapshot, shouldScheduleCheckpoint } from "./supervisor-tuning.ts";
 
 interface LiveState {
@@ -353,7 +353,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			executedToolCallIds: new Set(s.executedIds),
 			requirements: [...s.requirements],
 			manifest: s.manifest,
-			priorInterventions: s.recovery.history.map(h => ({ kind: h.kind, at: h.at, focus: h.objective })),
+			priorInterventions: s.recovery.history.map(h => ({ kind: h.kind, at: h.at, focus: h.objective, status: h.status === "resolved" ? "resolved" as const : "open" as const })),
 			config: s.config,
 			secrets: s.secrets,
 			scope: {
@@ -516,7 +516,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 					executedToolCallIds: new Set(s.executedIds),
 					requirements: [...s.requirements],
 					manifest: s.manifest,
-					priorInterventions: s.recovery.history.map(h => ({ kind: h.kind, at: h.at, focus: h.objective })),
+					priorInterventions: s.recovery.history.map(h => ({ kind: h.kind, at: h.at, focus: h.objective, status: h.status === "resolved" ? "resolved" as const : "open" as const })),
 					config: s.config,
 					secrets: s.secrets,
 					scope: {
@@ -856,23 +856,29 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 	}
 
 	function recordConcernOutcome(s: LiveState, assessment: Assessment): void {
-		if (!s.config.tuning.enabled || !s.recovery.active) return;
+		if (!s.config.tuning.enabled) return;
+		// The lease bounds the guidance, not the concern. After expiry the guidance is
+		// gone but the concern stays open, so a later grounded RESOLVED answer is still
+		// recorded instead of being dropped because `recovery.active` went null.
+		const concernId = openConcernKey(s.recovery);
+		if (!concernId) return;
 		const answer = assessment.answers.concern_outcome;
 		if (answer?.type !== "choice") return;
 		const probability = answer.probabilities[answer.choice] ?? 0;
 		const runner = Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, value]) => value));
 		const grounded = probability >= s.config.tuning.softThreshold && probability - runner >= s.config.tuning.softMinGap;
 		if (!grounded || answer.choice === "UNKNOWN") {
-			s.trace.record("intervention.lifecycle", { stage: "outcome_unknown", concernId: s.recovery.active.focusKey, probability, requestId: assessment.requestId });
+			s.trace.record("intervention.lifecycle", { stage: "outcome_unknown", concernId, probability, requestId: assessment.requestId });
 			return;
 		}
 		if (answer.choice === "RESOLVED") {
-			s.trace.record("intervention.lifecycle", { stage: "resolved", concernId: s.recovery.active.focusKey, probability, requestId: assessment.requestId, basis: "jev_concern_outcome" });
-			s.recovery.active = null;
+			// Only this grounded answer resolves the concern; expiry never does.
+			s.trace.record("intervention.lifecycle", { stage: "resolved", concernId, probability, requestId: assessment.requestId, basis: "jev_concern_outcome" });
+			resolveConcern(s.recovery, concernId);
 			s.guidanceKey = null;
 			return;
 		}
-		s.trace.record("intervention.lifecycle", { stage: "persists", concernId: s.recovery.active.focusKey, probability, requestId: assessment.requestId, basis: "jev_concern_outcome" });
+		s.trace.record("intervention.lifecycle", { stage: "persists", concernId, probability, requestId: assessment.requestId, basis: "jev_concern_outcome" });
 	}
 
 	function applyToolCallDecision(s: LiveState, decision: Decision | undefined, event: ToolCallEvent, ctx: ExtensionContext): ToolCallEventResult | undefined {

@@ -388,7 +388,7 @@ export function ledgerFromSnapshot(snapshot: EvidenceSnapshot): EvidenceLedger {
 			return { id: source.id, kind: "observation", text: source.text, source: source.source, references: retained?.argsHash ? [retained.argsHash] : undefined };
 		}),
 		trajectory: (rep.recent_actions ?? []).map((item, index) => ({ id: `trajectory:${index}`, kind: "trajectory", text: JSON.stringify(item), source: "snapshot.recent_actions" })),
-		concerns: snapshot.priorInterventions.map((item, index) => ({ id: `concern:${index}`, kind: "concern", text: item.focus, source: `prior_intervention:${item.at}`, status: "open" })),
+		concerns: snapshot.priorInterventions.map((item, index) => ({ id: `concern:${index}`, kind: "concern", text: item.focus, source: `prior_intervention:${item.at}`, status: item.status ?? "open" })),
 	};
 }
 

@@ -243,7 +243,7 @@ export interface EvidenceSnapshot {
 	sourceObservations?: Array<{ id: string; text: string; source: string }>;
 	/** Complete sanitized user turns plus their manifest-deduplicated transport form. */
 	sourceUserInstructions?: Array<{ id: string; text: string; transportText: string; source: string; order: number; references?: string[] }>;
-	priorInterventions: Array<{ kind: string; at: string; focus: string }>;
+	priorInterventions: Array<{ kind: string; at: string; focus: string; status?: "open" | "resolved" }>;
 	facts: DeterministicFact[];
 	scope: { sessionId: string; taskId: string; branch: string; snapshotHash: string };
 	/**

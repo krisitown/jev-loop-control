@@ -193,6 +193,25 @@ test("an open concern receives an independent semantic outcome question", () => 
 	assert.match(outcome?.instructions ?? "", /acknowledgement alone is not resolution/);
 });
 
+test("a resolved prior intervention is ledgered resolved and is not an open concern", () => {
+	const snapshot: EvidenceSnapshot = {
+		target: { kind: "proposal", proposalHash: "hash", messageRef: "assistant:1" },
+		task: { manifest: false, requirements: [], origin: "user" },
+		actorText: "continue", proposalText: "run the focused check", toolCalls: [], observations: [], sourceObservations: [], facts: [],
+		priorInterventions: [
+			// An expired-but-unresolved concern and one a grounded RESOLVED closed.
+			{ kind: "REPLAN", at: "2026-01-01T00:00:01.000Z", focus: "reconsider the contradicted diagnosis" },
+			{ kind: "VERIFY", at: "2026-01-01T00:00:02.000Z", focus: "address the unresolved obligation", status: "resolved" },
+		],
+		scope: { sessionId: "session", taskId: "task", branch: "main", snapshotHash: "snapshot" }, truncated: false, representation: {},
+	};
+	const value = ledgerFromSnapshot(snapshot);
+	assert.deepEqual(value.concerns?.map((unit) => unit.status), ["open", "resolved"], "an unmarked concern is open; only a resolution is not");
+	const packet = buildAssessmentPacket(value, { selector: "s2", softPayloadBytes: 4096, assessmentScope: { kind: "proposal", targetId: `proposal:${snapshot.target.proposalHash}` } }).packet;
+	assert.deepEqual(packet.open_concerns.map((unit) => unit.text), ["reconsider the contradicted diagnosis"]);
+	assert.equal(buildCorrectionQuestions(packet).some((question) => question.id === "concern_outcome"), true, "the still-open concern keeps its outcome question");
+});
+
 test("strong action requires supported grounding and a qualifying concern", () => {
 	const base = {
 		correction: { choice: "CORRECTION_JUSTIFIED", probabilities: { CORRECTION_JUSTIFIED: .9, NO_CORRECTION_JUSTIFIED: .08, INSUFFICIENT_EVIDENCE: .02 } },

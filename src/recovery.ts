@@ -5,6 +5,11 @@
  * expires. Expiry is not success, and a replaced recovery is marked expired in
  * the history rather than left dangling as `active`.
  *
+ * The lease bounds the GUIDANCE, never the concern. An expired concern stops
+ * being injected but stays open until a grounded `concern_outcome=RESOLVED`
+ * answer closes it, so expiry can never be mistaken for resolution and can never
+ * make a later RESOLVED answer unrecordable.
+ *
  * The evidence key is what makes repeats cheap: the same focus plus the same
  * observed evidence must never trigger the same intervention twice. Therefore
  * the key is built only from EXECUTED observations (a blocked or invalid call is
@@ -24,7 +29,8 @@ export const RECOVERY_EVIDENCE_WINDOW = 6;
 
 export interface RecoveryHistoryEntry {
 	kind: RecoveryMode;
-	status: "active" | "expired";
+	/** `resolved` is set only by a grounded RESOLVED outcome, never by expiry. */
+	status: "active" | "expired" | "resolved";
 	focus: string;
 	at: string;
 	objective: string;
@@ -116,6 +122,47 @@ export function advanceRecovery(state: RecoveryState): boolean {
 	}
 
 	return false;
+}
+
+/**
+ * The concern whose outcome is still owed. The guidance in force owns the
+ * concern; once its lease expires the most recent concern that nothing resolved
+ * still carries that identity, so a later RESOLVED/PERSISTS/UNKNOWN answer has
+ * something to attach to instead of being dropped.
+ */
+export function openConcernKey(state: RecoveryState): string | null {
+	if (state.active) {
+		return state.active.focusKey;
+	}
+	for (let index = state.history.length - 1; index >= 0; index -= 1) {
+		const entry = state.history[index]!;
+		if (entry.status !== "resolved") {
+			return entry.focus;
+		}
+	}
+	return null;
+}
+
+/**
+ * Close an open concern on a grounded RESOLVED outcome. This is the only path to
+ * `resolved`: expiry and replacement leave the concern open.
+ */
+export function resolveConcern(state: RecoveryState, focusKey: string): boolean {
+	let matched = false;
+	for (const entry of state.history) {
+		// A focus key is the concern identity. It may have been re-armed after new
+		// evidence, so close every historical lease for this same concern together.
+		if (entry.focus === focusKey && entry.status !== "resolved") {
+			entry.status = "resolved";
+			matched = true;
+		}
+	}
+	if (state.active?.focusKey === focusKey) {
+		// Resolved guidance is no longer guidance: it stops being injected at once.
+		state.active = null;
+		matched = true;
+	}
+	return matched;
 }
 
 /** The one history entry currently in force, if any, becomes expired. */

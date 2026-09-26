@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0-dev.14 - 2026-09-26
+
+- Keeps a concern open after its bounded guidance lease expires until a grounded
+  resolution is recorded; resolving a focus closes all historical leases for
+  that same focus so stale entries cannot reactivate it.
+- Experimental development checkpoint. The lifecycle behavior was exercised in
+  one seeded real Jev/Qwen/Pi continuation with a passing independent repair
+  check; holdout specificity, full paired continuations, and campaign readiness
+  remain unqualified.
+
 Notable changes to `jev-loop-control`. Entries describe behaviour present in the
 code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an

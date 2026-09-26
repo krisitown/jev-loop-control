@@ -41,6 +41,13 @@ interface Probe {
  */
 class AnswerMismatch extends Error {}
 
+/**
+ * What the scripted verifier says about an open concern, per dispatched direction
+ * request. A bare string is a firm answer; the object form carries the support,
+ * so a weakly supported RESOLVED can be distinguished from a grounded one.
+ */
+type ConcernOutcome = "RESOLVED" | "PERSISTS" | "UNKNOWN" | { choice: "RESOLVED" | "PERSISTS" | "UNKNOWN"; probability: number };
+
 interface RunResult {
 	fixture: Awaited<ReturnType<typeof createFixture>>;
 	probe: Probe;
@@ -51,7 +58,7 @@ interface RunResult {
 }
 
 /** Answers scripted per direction request; completion is always MET/COMPLETE. */
-function fakeClient(script: { direction: Array<"VERIFY" | "PROCEED">; tuned?: Array<"none" | "soft" | "strong"> }, sent: RunResult["sent"]): JevClient {
+function fakeClient(script: { direction: Array<"VERIFY" | "PROCEED">; tuned?: Array<"none" | "soft" | "strong">; outcomes?: ConcernOutcome[] }, sent: RunResult["sent"]): JevClient {
 	let directionIndex = 0;
 	const scrub = makeScrub([FAKE_KEY]);
 	return {
@@ -62,8 +69,14 @@ function fakeClient(script: { direction: Array<"VERIFY" | "PROCEED">; tuned?: Ar
 			const legacyVerdict = script.direction[Math.min(index, script.direction.length - 1)] ?? "PROCEED";
 			const tunedVerdict = script.tuned?.[Math.min(index, script.tuned.length - 1)] ?? "none";
 			const tunedCorrection = tunedVerdict !== "none";
+			// Past the end of the script there is no scripted outcome: the honest answer
+			// for an unexamined concern is UNKNOWN.
+			const scripted = script.outcomes?.[index];
+			const outcomeChoice = typeof scripted === "string" ? scripted : scripted?.choice ?? "UNKNOWN";
+			const outcomeProbability = typeof scripted === "object" && scripted !== null ? scripted.probability : 0.9;
 			const answers: Record<string, Assessment["answers"][string]> = {};
 			for (const question of questions) {
+				let top = question.role === "correction_needed" && tunedVerdict === "soft" ? 0.7 : 0.9;
 				if (question.type === "noul") {
 					answers[question.id] = { type: "noul", questionId: question.id, noul: 0.9 };
 					continue;
@@ -85,12 +98,12 @@ function fakeClient(script: { direction: Array<"VERIFY" | "PROCEED">; tuned?: Ar
 				else if (question.role === "evidence_anchor") selected = tunedCorrection ? (Object.keys(question.criteria).find((id) => id !== "NONE" && id !== "UNKNOWN") ?? "UNKNOWN") : "NONE";
 				else if (question.role === "requirement_focus") selected = tunedCorrection ? (Object.keys(question.criteria).find((id) => !["PROCESS", "NONE", "UNKNOWN"].includes(id)) ?? "UNKNOWN") : "NONE";
 				else if (question.role === "completion_status") selected = "SUPPORTED";
-				else if (question.role === "concern_outcome") selected = "UNKNOWN";
+				else if (question.role === "concern_outcome") { selected = outcomeChoice; top = outcomeProbability; }
 				answers[question.id] = {
 					type: "choice",
 					questionId: question.id,
 					choice: selected,
-					probabilities: weightsFor(question, selected, question.role === "correction_needed" && tunedVerdict === "soft" ? 0.7 : 0.9),
+					probabilities: weightsFor(question, selected, top),
 					confidence: 0.9,
 				};
 			}
@@ -168,6 +181,8 @@ async function runFixture(
 		script?: FixtureOptions["script"];
 		tuning?: Record<string, unknown>;
 		tuned?: Array<"none" | "soft" | "strong">;
+		/** Concern outcomes, indexed by dispatched direction request. */
+		outcomes?: ConcernOutcome[];
 	},
 ): Promise<RunResult> {
 	const supervisorDir = mkdtempSync(join(tmpdir(), "jev-live-config-"));
@@ -240,7 +255,7 @@ async function runFixture(
 			{
 				name: "jev-loop-control-live",
 				factory: ((pi: ExtensionAPI) => {
-					liveObserve(pi, { client: fakeClient({ direction: options.direction, ...(options.tuned ? { tuned: options.tuned } : {}) }, sent) });
+					liveObserve(pi, { client: fakeClient({ direction: options.direction, ...(options.tuned ? { tuned: options.tuned } : {}), ...(options.outcomes ? { outcomes: options.outcomes } : {}) }, sent) });
 				}) satisfies ExtensionFactory,
 			},
 			{ name: "context-probe", factory: contextProbe },
@@ -537,4 +552,109 @@ test("repeated-failure fallback reads the real snapshot contract honestly", () =
 	const hit = repeatedFailureFocus(snapshot, defaultConfig(), 0.9);
 	assert.deepEqual(hit, { toolName: "write_toy", argsHash: "h1", evidenceIds: ["E1", "E2"] });
 	assert.equal(repeatedFailureFocus(snapshot, defaultConfig(), 0.5), null, "the diagnostic threshold is required");
+});
+
+/**
+ * Concern lifecycle past the recovery lease, through the shipped adapter and the
+ * real Pi lifecycle. One grounded soft correction raises a concern; the
+ * two-proposal lease then expires on its own. The only difference between the runs
+ * below is what the scripted verifier says about the concern afterwards.
+ *
+ * The lease bounds the GUIDANCE, never the concern: expiry stops injecting and
+ * must never decide whether the concern's outcome can still be recorded.
+ */
+const CONCERN_SCRIPT = [
+	fauxAssistantMessage([fauxToolCall("read_toy", { path: "notes.txt" }, { id: "call-read-1" })]),
+	fauxAssistantMessage([fauxToolCall("write_toy", { path: "notes.txt", text: "corrected" }, { id: "call-write-2" })]),
+	fauxAssistantMessage([fauxToolCall("read_toy", { path: "notes.txt" }, { id: "call-read-3" })]),
+	fauxAssistantMessage([fauxToolCall("write_toy", { path: "notes.txt", text: "verified" }, { id: "call-write-4" })]),
+	fauxAssistantMessage("Followed the correction and confirmed the current file."),
+];
+
+const CONCERN_TUNING = {
+	enabled: true, selector: "s2", softPayloadBytes: 24_576,
+	softThreshold: 0.62, strongThreshold: 0.84, softMinGap: 0.12, strongMinGap: 0.24,
+	proposalEvery: 1, completionEnabled: true, cooldownCheckpoints: 0,
+};
+
+/** One raised concern, one expired lease, then whatever `outcomes` scripts. */
+async function runConcernFixture(
+	t: { after(fn: () => void): void },
+	outcomes?: ConcernOutcome[],
+): Promise<{ run: RunResult; lifecycle: Array<Record<string, unknown>>; concernId: unknown }> {
+	const run = await runFixture(t, {
+		mode: "enforce",
+		direction: ["PROCEED", "PROCEED", "PROCEED", "PROCEED", "PROCEED"],
+		// Exactly one correction is applied, so exactly one concern exists.
+		tuned: ["soft", "none", "none", "none", "none"],
+		...(outcomes ? { outcomes } : {}),
+		prompts: ["Read notes.txt, then correct what it contradicts and confirm."],
+		tuning: CONCERN_TUNING,
+		script: CONCERN_SCRIPT,
+	});
+	assert.equal(run.fixture.errors.length, 0, `no extension errors: ${JSON.stringify(run.fixture.errors)}`);
+	const lifecycle = ofType(run.events, "intervention.lifecycle");
+	const raised = lifecycle.find((event) => event.stage === "applied" && event.action === "soft");
+	assert.ok(raised, "the grounded soft correction applied one concern");
+	assert.ok(lifecycle.some((event) => event.stage === "delivered" && event.concernId === raised!.concernId), "the concern's guidance really reached the actor");
+	assert.ok(
+		lifecycle.some((event) => event.stage === "expired" && event.concernId === raised!.concernId && event.resolved === false),
+		`the lease ran out on its own: ${JSON.stringify(lifecycle)}`,
+	);
+	return { run, lifecycle, concernId: raised!.concernId };
+}
+
+/** The concerns the production packet builder put in the last direction request. */
+function openConcerns(run: RunResult): Array<Record<string, unknown>> {
+	const last = run.sent.filter((request) => request.kind === "direction").at(-1)!;
+	const packet = last.state as { open_concerns?: Array<Record<string, unknown>> };
+	return packet.open_concerns ?? [];
+}
+
+test("a grounded RESOLVED answer after the lease expired resolves the concern", async (t) => {
+	const { run, lifecycle, concernId } = await runConcernFixture(t, ["UNKNOWN", "UNKNOWN", "RESOLVED"]);
+
+	const resolved = lifecycle.filter((event) => event.stage === "resolved");
+	assert.equal(resolved.length, 1, `the late RESOLVED answer is recorded once: ${JSON.stringify(lifecycle)}`);
+	assert.equal(resolved[0]!.concernId, concernId, "resolution is attached to the expired concern's identity");
+	assert.equal(resolved[0]!.basis, "jev_concern_outcome", "only the Jev outcome resolves it");
+
+	assert.deepEqual(openConcerns(run), [], "a resolved concern is never sent as an open concern again");
+	const last = run.sent.filter((request) => request.kind === "direction").at(-1)!;
+	assert.equal(last.questions.some((question) => question.id === "concern_outcome"), false, "with no open concern, no outcome question is asked");
+});
+
+test("lease expiry without an outcome leaves the concern open and unresolved", async (t) => {
+	const { run, lifecycle, concernId } = await runConcernFixture(t);
+
+	assert.equal(lifecycle.some((event) => event.stage === "resolved"), false, "expiry is never resolution");
+	const unknown = lifecycle.filter((event) => event.stage === "outcome_unknown" && event.concernId === concernId);
+	// One while the guidance was in force, then one or more after it expired: the
+	// concern keeps its outcome slot even when nothing injects it any more.
+	assert.ok(unknown.length >= 2, `outcomes are still recorded past expiry: ${JSON.stringify(unknown)}`);
+	assert.ok(openConcerns(run).length > 0, "an unresolved concern stays an open concern");
+});
+
+test("a weakly supported RESOLVED answer does not close the concern", async (t) => {
+	const { run, lifecycle, concernId } = await runConcernFixture(t, ["UNKNOWN", "UNKNOWN", { choice: "RESOLVED", probability: 0.5 }]);
+
+	assert.equal(lifecycle.some((event) => event.stage === "resolved"), false, "below the grounding threshold nothing closes");
+	assert.ok(
+		lifecycle.some((event) => event.stage === "outcome_unknown" && event.concernId === concernId && event.probability === 0.5),
+		`the weak answer is recorded as an unknown outcome: ${JSON.stringify(lifecycle)}`,
+	);
+	assert.ok(openConcerns(run).length > 0, "an ungrounded RESOLVED leaves the concern open");
+});
+
+test("a RESOLVED answer at the completion boundary resolves the expired concern", async (t) => {
+	// The lease is already gone when the actor's completion claim is assessed, so
+	// a fix that Jev verifies at completion must still close its concern.
+	const { run, lifecycle, concernId } = await runConcernFixture(t, ["UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "RESOLVED"]);
+
+	const resolved = lifecycle.filter((event) => event.stage === "resolved");
+	assert.equal(resolved.length, 1, `the completion answer resolves exactly once: ${JSON.stringify(lifecycle)}`);
+	assert.equal(resolved[0]!.concernId, concernId);
+	const completion = ofType(run.events, "completion_assessment").at(-1)!;
+	assert.equal(resolved[0]!.requestId, completion.requestId, "the completion assessment's answer is what closed the concern");
+	assert.equal(openConcerns(run).length, 1, "the concern was still open in the last direction packet before completion");
 });

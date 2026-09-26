@@ -4,17 +4,21 @@ import {
 	advanceRecovery,
 	beginRecovery,
 	createRecovery,
+	openConcernKey,
 	recoveryEvidenceKey,
 	recoveryInstruction,
+	resolveConcern,
 	type RecoveryMode,
 } from "../src/recovery.ts";
 import { stableJson } from "../src/redact.ts";
 import type { EvidenceSnapshot, SnapshotObservation } from "../src/types.ts";
 
 /**
- * Recovery lease, duplicate suppression, and the evidence key that decides
- * whether an intervention is new. Real assertions only: a recovery that cannot
- * be distinguished from a repeat is worse than no recovery at all.
+ * Recovery lease, duplicate suppression, concern lifecycle, and the evidence key
+ * that decides whether an intervention is new. Real assertions only: a recovery
+ * that cannot be distinguished from a repeat is worse than no recovery at all,
+ * and a concern that expiry could silently close would report a finished fix that
+ * nobody verified.
  */
 
 let idSeq = 0;
@@ -99,6 +103,61 @@ test("new evidence for the same focus is allowed", () => {
 	begin(state, "RESEARCH", "f1", "e1");
 	assert.equal(begin(state, "RESEARCH", "f1", "e2"), true, "genuinely new evidence re-enables guidance");
 	assert.equal(state.active?.evidenceKey, "e2");
+});
+
+test("expiry stops the guidance but keeps the concern open for a later outcome", () => {
+	const state = createRecovery();
+	begin(state, "REPLAN", "f1", "e1");
+	assert.equal(openConcernKey(state), "f1", "while in force, the active recovery owns the concern");
+
+	advanceRecovery(state);
+	advanceRecovery(state);
+	assert.equal(state.active, null, "the lease really ran out");
+	assert.equal(recoveryInstruction(state), null, "expired guidance is never injected again");
+	assert.equal(openConcernKey(state), "f1", "expiry does not discard the concern's identity");
+
+	assert.equal(resolveConcern(state, "f1"), true, "a grounded RESOLVED answer can still close it");
+	assert.equal(state.history[0]!.status, "resolved", "the closed concern is marked, not deleted");
+	assert.equal(openConcernKey(state), null, "a resolved concern is no longer open");
+	assert.equal(resolveConcern(state, "f1"), false, "nothing resolves twice");
+	assert.equal(begin(state, "REPLAN", "f1", "e1"), false, "resolution does not re-arm the duplicate guard");
+});
+
+test("a grounded resolution stops an active recovery's guidance at once", () => {
+	const state = createRecovery();
+	begin(state, "VERIFY", "f1", "e1");
+	assert.equal(resolveConcern(state, "f1"), true);
+	assert.equal(state.active, null, "resolved guidance is not injected again");
+	assert.equal(recoveryInstruction(state), null);
+	assert.equal(state.history[0]!.status, "resolved");
+	assert.equal(openConcernKey(state), null, "nothing is left to assess");
+});
+
+test("the newest concern that nothing resolved owns a later outcome", () => {
+	const state = createRecovery();
+	begin(state, "RESEARCH", "f1", "e1");
+	begin(state, "REPLAN", "f2", "e2");
+	assert.equal(openConcernKey(state), "f2", "the recovery in force is the open concern");
+
+	assert.equal(resolveConcern(state, "f2"), true);
+	assert.equal(openConcernKey(state), "f1", "a superseded-and-expired concern stays open until resolved");
+	assert.equal(resolveConcern(state, "f1"), true);
+	assert.equal(openConcernKey(state), null);
+});
+
+test("resolving a re-armed focus closes all leases for that same concern", () => {
+	const state = createRecovery();
+	begin(state, "REPLAN", "same-focus", "e1");
+	advanceRecovery(state);
+	advanceRecovery(state);
+	begin(state, "VERIFY", "same-focus", "e2");
+	advanceRecovery(state);
+	advanceRecovery(state);
+
+	assert.equal(state.history.filter((entry) => entry.focus === "same-focus" && entry.status !== "resolved").length, 2);
+	assert.equal(resolveConcern(state, "same-focus"), true);
+	assert.equal(openConcernKey(state), null, "older expired leases for a resolved focus cannot reopen it");
+	assert.ok(state.history.every((entry) => entry.status === "resolved"));
 });
 
 test("instruction renders mode, objective, and that expiry is not completion", () => {
