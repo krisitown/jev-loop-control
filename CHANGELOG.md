@@ -5,6 +5,24 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
+## 0.4.0-dev.7 - 2026-09-26
+
+- Prevents the tuned production adapter from invoking legacy middle-clipping
+  fallback when protected proposal, goal, or complete questions cannot fit the
+  bounded final wire envelope; the checkpoint is recorded as unchecked instead.
+- Requires unambiguous concern, anchor, and applicable requirement selections
+  for hard redirects. Diffuse but valid grounding can still produce bounded soft
+  advice, without imposing a blanket auxiliary probability threshold.
+- Allows the exact current proposal and the user goal to ground contract
+  contradictions, including the default single-requirement task representation.
+- Preserves selected evidence and requirement units intact in delivered guidance
+  and renders concern-specific next actions and observable exit checks.
+- Records hard guidance as queued at the block boundary and delivered only when
+  the next actor context contains it. Supported completion remains uncertified
+  while global packet coverage is unknown or partial.
+- Development checkpoint only. Hosted Jev semantics, real actor continuation,
+  frozen package installation, and campaign resumption remain unvalidated.
+
 ## 0.4.0-dev.6 - 2026-09-26
 
 - Adds a production-adapter regression proving an 18K-character Unicode tool

@@ -196,6 +196,7 @@ export const CORRECTION_QUESTION_VERSION = "correction-v1";
 
 export function buildCorrectionQuestions(packet: AssessmentPacket): ChoiceQuestion[] {
 	const evidenceCriteria: Record<string, string> = {};
+	if (packet.current_proposal) evidenceCriteria[packet.current_proposal.id] = `Exact assessed proposal from ${packet.current_proposal.source}`;
 	for (const unit of [...packet.recent_evidence, ...packet.trajectory, ...packet.open_concerns]) evidenceCriteria[unit.id] = `Source anchor ${unit.id} from ${unit.source}`;
 	evidenceCriteria.NONE = "No supplied anchor demonstrates a correction.";
 	evidenceCriteria.UNKNOWN = "Support cannot be located in the supplied packet.";
@@ -227,7 +228,7 @@ export type SuppressionReason = "below_soft_threshold" | "below_strong_threshold
 export interface CorrectionProfile { softThreshold: number; strongThreshold: number; softMinGap: number; strongMinGap: number; strongConcerns: string[]; }
 export interface PolicyAnswer { choice: string; probabilities: Record<string, number>; }
 export interface CorrectionPolicyInput { correction?: PolicyAnswer; concern?: PolicyAnswer; anchor?: PolicyAnswer; requirement?: PolicyAnswer; availableAnchorIds: string[]; availableRequirementIds: string[]; duplicate?: boolean; cooldown?: boolean; budgetAvailable?: boolean; }
-export interface CorrectionPolicyResult { action: CorrectionAction; suppressionReason: SuppressionReason | null; correctionScore: number; concern: string | null; anchorId: string | null; requirementId: string | null; grounded: boolean; }
+export interface CorrectionPolicyResult { action: CorrectionAction; suppressionReason: SuppressionReason | null; correctionScore: number; concern: string | null; anchorId: string | null; requirementId: string | null; grounded: boolean; strongGrounding: boolean; }
 
 function selectedMargin(answer: PolicyAnswer | undefined): number {
 	if (!answer) return 0;
@@ -244,7 +245,15 @@ export function evaluateCorrectionPolicy(input: CorrectionPolicyInput, profile: 
 	const groundedAnchor = !!anchorId && input.availableAnchorIds.includes(anchorId);
 	const groundedRequirement = concern !== "CONTRACT_CONTRADICTION" || (!!requirementId && input.availableRequirementIds.includes(requirementId));
 	const grounded = groundedAnchor && groundedRequirement;
-	const base = { correctionScore: score, concern, anchorId, requirementId, grounded };
+	// A selected source id establishes syntactic grounding for advice, but a hard
+	// redirect also needs the auxiliary choices to be unambiguous. Requiring a
+	// margin (rather than a blanket 0.8 probability) works for both small and large
+	// option sets and lets a weakly grounded concern remain bounded soft advice.
+	const strongGrounding = grounded
+		&& selectedMargin(input.concern) >= profile.strongMinGap
+		&& selectedMargin(input.anchor) >= profile.strongMinGap
+		&& (concern !== "CONTRACT_CONTRADICTION" || selectedMargin(input.requirement) >= profile.strongMinGap);
+	const base = { correctionScore: score, concern, anchorId, requirementId, grounded, strongGrounding };
 	if (!input.correction || !input.concern || !input.anchor) return { action: "none", suppressionReason: "unavailable", ...base };
 	if (input.correction.choice === "INSUFFICIENT_EVIDENCE" || concern === "INSUFFICIENT_EVIDENCE") return { action: "none", suppressionReason: "insufficient_evidence", ...base };
 	if (input.correction.choice !== "CORRECTION_JUSTIFIED" || concern === "NONE") return { action: "none", suppressionReason: "already_addressed", ...base };
@@ -254,7 +263,7 @@ export function evaluateCorrectionPolicy(input: CorrectionPolicyInput, profile: 
 	if (!grounded) return { action: "none", suppressionReason: "unsupported_grounding", ...base };
 	const gap = selectedMargin(input.correction);
 	if (score < profile.softThreshold || gap < profile.softMinGap) return { action: "none", suppressionReason: "below_soft_threshold", ...base };
-	if (score >= profile.strongThreshold && gap >= profile.strongMinGap && profile.strongConcerns.includes(concern ?? "")) return { action: "strong", suppressionReason: null, ...base };
+	if (score >= profile.strongThreshold && gap >= profile.strongMinGap && profile.strongConcerns.includes(concern ?? "") && strongGrounding) return { action: "strong", suppressionReason: null, ...base };
 	return { action: "soft", suppressionReason: score < profile.strongThreshold ? "below_strong_threshold" : null, ...base };
 }
 
@@ -321,20 +330,30 @@ export function decideCorrectionAssessment(assessment: Assessment, snapshot: Evi
 	const packet = flags.packet ?? buildAssessmentPacket(ledgerFromSnapshot(snapshot), { selector: config.tuning.selector, softPayloadBytes: config.tuning.softPayloadBytes, assessmentScope: { kind: snapshot.target.kind, targetId: `proposal:${snapshot.target.proposalHash}` } }).packet;
 	const result = evaluateCorrectionPolicy({
 		correction: answer("correction_needed"), concern: answer("primary_concern"), anchor: answer("evidence_anchor"), requirement: answer("requirement_focus"),
-		availableAnchorIds: [...packet.recent_evidence, ...packet.trajectory, ...packet.open_concerns].map((item) => item.id),
-		availableRequirementIds: packet.applicable_requirements.map((item) => item.id), ...flags,
+		availableAnchorIds: [...(packet.current_proposal ? [packet.current_proposal] : []), ...packet.recent_evidence, ...packet.trajectory, ...packet.open_concerns].map((item) => item.id),
+		availableRequirementIds: [packet.user_goal.id, ...packet.applicable_requirements.map((item) => item.id)], ...flags,
 	}, { softThreshold: config.tuning.softThreshold, strongThreshold: config.tuning.strongThreshold, softMinGap: config.tuning.softMinGap, strongMinGap: config.tuning.strongMinGap, strongConcerns: ["CONTRACT_CONTRADICTION", "CONTRADICTED_DIAGNOSIS", "UNSUPPORTED_COMPLETION"] });
 	const focusKey = result.concern && result.anchorId ? `correction:${snapshot.scope.branch}:${result.concern}:${result.anchorId}` : null;
-	const anchor = [...packet.recent_evidence, ...packet.trajectory, ...packet.open_concerns].find((item) => item.id === result.anchorId);
-	const requirement = packet.applicable_requirements.find((item) => item.id === result.requirementId);
-	const memo = result.action === "none" ? null : `Jev identified ${result.concern}. Evidence (${anchor?.id ?? "unknown"}): ${anchor?.text.slice(0, 500) ?? "unavailable"}${requirement ? ` Requirement (${requirement.id}): ${requirement.text.slice(0, 500)}` : ""} Change the next action to address this evidence, then rerun the directly relevant check and stop when it passes or produces a new specific diagnosis.`;
+	const anchor = [...(packet.current_proposal ? [packet.current_proposal] : []), ...packet.recent_evidence, ...packet.trajectory, ...packet.open_concerns].find((item) => item.id === result.anchorId);
+	const requirement = result.requirementId === packet.user_goal.id ? packet.user_goal : packet.applicable_requirements.find((item) => item.id === result.requirementId);
+	const nextAction = correctionGuidance(result.concern);
+	// These units already passed the configured packet bound. Preserve them whole
+	// here: silently slicing the selected source can remove the very diagnostic or
+	// requirement qualifier that made the intervention supportable.
+	const memo = result.action === "none" ? null : [
+		`Concern: Jev identified ${result.concern}.`,
+		`Evidence (${anchor?.id ?? "unknown"}, source ${anchor?.source ?? "unavailable"}): ${anchor?.text ?? "unavailable"}`,
+		...(requirement ? [`Requirement (${requirement.id}, source ${requirement.source}): ${requirement.text}`] : []),
+		`Next action: ${nextAction.action}`,
+		`Exit check: ${nextAction.exit}`,
+	].join("\n");
 	return {
 		assessment,
 		apply: result.action === "strong" ? "block" : result.action === "soft" ? "continue" : "none",
 		status: result.action === "none"
 			? (!assessment.ok || result.suppressionReason === "unavailable" ? "UNCHECKED" : result.suppressionReason === "insufficient_evidence" || result.suppressionReason === "unsupported_grounding" ? "UNRESOLVED" : "EXECUTE")
 			: "REPLAN",
-		reasons: [result.action === "none" ? `suppressed:${result.suppressionReason ?? "none"}` : `action:${result.action}`, `correction_score:${result.correctionScore.toFixed(3)}`, `grounded:${result.grounded}`],
+		reasons: [result.action === "none" ? `suppressed:${result.suppressionReason ?? "none"}` : `action:${result.action}`, `correction_score:${result.correctionScore.toFixed(3)}`, `grounded:${result.grounded}`, `strong_grounding:${result.strongGrounding}`],
 		memo,
 		focusKey,
 	};
@@ -343,11 +362,30 @@ export function decideCorrectionAssessment(assessment: Assessment, snapshot: Evi
 export function decideTunedCompletion(assessment: Assessment, snapshot: EvidenceSnapshot, config: SupervisorConfig, flags: { budgetAvailable?: boolean; packet?: AssessmentPacket } = {}): Decision {
 	const status = assessment.answers.completion_status;
 	if (!assessment.ok || status?.type !== "choice") return { assessment, apply: "none", status: "UNCHECKED", reasons: ["completion assessment unavailable"], memo: null, focusKey: null };
-	if (status.choice === "SUPPORTED" && !assessment.partialCoverage && !snapshot.truncated) return { assessment, apply: "none", status: "COMPLETE", reasons: ["completion_status=SUPPORTED with complete local representation"], memo: null, focusKey: null };
+	const packet = flags.packet ?? buildAssessmentPacket(ledgerFromSnapshot(snapshot), { selector: config.tuning.selector, softPayloadBytes: config.tuning.softPayloadBytes, assessmentScope: { kind: snapshot.target.kind, targetId: `proposal:${snapshot.target.proposalHash}` } }).packet;
+	if (status.choice === "SUPPORTED" && !assessment.partialCoverage && !snapshot.truncated && packet.coverage.global === "complete") return { assessment, apply: "none", status: "COMPLETE", reasons: ["completion_status=SUPPORTED with verified complete coverage"], memo: null, focusKey: null };
+	if (status.choice === "SUPPORTED") return { assessment, apply: "none", status: "UNRESOLVED", reasons: [`completion_status=SUPPORTED but global coverage is ${packet.coverage.global}; completion is not certified`], memo: null, focusKey: null };
 	if (status.choice !== "CONTRADICTED") return { assessment, apply: "none", status: "UNRESOLVED", reasons: ["completion_status=NOT_ESTABLISHED; completion is not certified"], memo: null, focusKey: null };
 	const correction = decideCorrectionAssessment(assessment, snapshot, config, flags);
 	if (correction.apply === "block") correction.apply = "continue";
 	correction.status = correction.apply === "continue" ? "REPLAN" : "UNRESOLVED";
 	correction.reasons.unshift("completion_status=CONTRADICTED");
 	return correction;
+}
+
+function correctionGuidance(concern: string | null): { action: string; exit: string } {
+	switch (concern) {
+		case "CONTRACT_CONTRADICTION":
+			return { action: "reconcile the proposed action with the quoted requirement before executing it", exit: "the revised action preserves the quoted requirement and a directly relevant check, when available, confirms it" };
+		case "CONTRADICTED_DIAGNOSIS":
+			return { action: "replace the contradicted assumption with a diagnosis consistent with the quoted observation, then take one bounded discriminating step", exit: "the next observation distinguishes the revised diagnosis or supplies a new specific one" };
+		case "UNPRODUCTIVE_REPEAT":
+			return { action: "state the relevant changed state or expected information gain; if there is none, choose a different bounded step", exit: "the next step produces new relevant evidence or resolves the concern" };
+		case "SCOPE_DRIFT":
+			return { action: "return the next step to the supplied user goal and defer unrelated work", exit: "the next action has a source-backed connection to the supplied goal" };
+		case "UNSUPPORTED_COMPLETION":
+			return { action: "address the visible unresolved obligation before asserting completion", exit: "current source-backed verification supports that exact obligation" };
+		default:
+			return { action: "reconsider the proposed action against the quoted evidence", exit: "a new source-backed observation resolves or narrows the concern" };
+	}
 }

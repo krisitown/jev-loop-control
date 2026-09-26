@@ -51,12 +51,16 @@ interface RunResult {
 }
 
 /** Answers scripted per direction request; completion is always MET/COMPLETE. */
-function fakeClient(script: { direction: Array<"VERIFY" | "PROCEED"> }, sent: RunResult["sent"]): JevClient {
+function fakeClient(script: { direction: Array<"VERIFY" | "PROCEED">; tuned?: Array<"none" | "strong"> }, sent: RunResult["sent"]): JevClient {
 	let directionIndex = 0;
 	const scrub = makeScrub([FAKE_KEY]);
 	return {
 		origin: "synthetic",
 		async assess({ kind, questions, state }): Promise<Assessment> {
+			const index = directionIndex;
+			if (kind === "direction") directionIndex++;
+			const legacyVerdict = script.direction[Math.min(index, script.direction.length - 1)] ?? "PROCEED";
+			const tunedVerdict = script.tuned?.[Math.min(index, script.tuned.length - 1)] ?? "none";
 			const answers: Record<string, Assessment["answers"][string]> = {};
 			for (const question of questions) {
 				if (question.type === "noul") {
@@ -66,9 +70,7 @@ function fakeClient(script: { direction: Array<"VERIFY" | "PROCEED"> }, sent: Ru
 				let selected = "MET";
 				if (question.role === "next_step") {
 					if (kind === "direction") {
-						const verdict = script.direction[Math.min(directionIndex, script.direction.length - 1)] ?? "PROCEED";
-						directionIndex++;
-						selected = verdict;
+						selected = legacyVerdict;
 					}
 					else {
 						selected = "COMPLETE";
@@ -77,9 +79,10 @@ function fakeClient(script: { direction: Array<"VERIFY" | "PROCEED"> }, sent: Ru
 				else if (question.role === "focus_requirement") {
 					selected = question.criteria.R1 === undefined ? "NONE" : "R1";
 				}
-				else if (question.role === "correction_needed") selected = "NO_CORRECTION_JUSTIFIED";
-				else if (question.role === "primary_concern") selected = "NONE";
-				else if (question.role === "evidence_anchor" || question.role === "requirement_focus") selected = "NONE";
+				else if (question.role === "correction_needed") selected = tunedVerdict === "strong" ? "CORRECTION_JUSTIFIED" : "NO_CORRECTION_JUSTIFIED";
+				else if (question.role === "primary_concern") selected = tunedVerdict === "strong" ? "CONTRACT_CONTRADICTION" : "NONE";
+				else if (question.role === "evidence_anchor") selected = tunedVerdict === "strong" ? (Object.keys(question.criteria).find((id) => id !== "NONE" && id !== "UNKNOWN") ?? "UNKNOWN") : "NONE";
+				else if (question.role === "requirement_focus") selected = tunedVerdict === "strong" ? (Object.keys(question.criteria).find((id) => !["PROCESS", "NONE", "UNKNOWN"].includes(id)) ?? "UNKNOWN") : "NONE";
 				else if (question.role === "completion_status") selected = "SUPPORTED";
 				else if (question.role === "concern_outcome") selected = "UNKNOWN";
 				answers[question.id] = {
@@ -163,6 +166,7 @@ async function runFixture(
 		prompts: string[];
 		script?: FixtureOptions["script"];
 		tuning?: Record<string, unknown>;
+		tuned?: Array<"none" | "strong">;
 	},
 ): Promise<RunResult> {
 	const supervisorDir = mkdtempSync(join(tmpdir(), "jev-live-config-"));
@@ -235,7 +239,7 @@ async function runFixture(
 			{
 				name: "jev-loop-control-live",
 				factory: ((pi: ExtensionAPI) => {
-					liveObserve(pi, { client: fakeClient({ direction: options.direction }, sent) });
+					liveObserve(pi, { client: fakeClient({ direction: options.direction, ...(options.tuned ? { tuned: options.tuned } : {}) }, sent) });
 				}) satisfies ExtensionFactory,
 			},
 			{ name: "context-probe", factory: contextProbe },
@@ -264,7 +268,7 @@ async function runFixture(
 
 test("tuned adapter preserves large Unicode proposal units and complete question instructions", async (t) => {
 	const marker = "КРАЕН_Ω_🧪_中間";
-	const large = `${"а".repeat(9000)}${marker}${"β".repeat(9000)}`;
+	const large = `${"а".repeat(5000)}${marker}${"β".repeat(5000)}`;
 	const run = await runFixture(t, {
 		mode: "observe",
 		direction: ["PROCEED"],
@@ -283,6 +287,46 @@ test("tuned adapter preserves large Unicode proposal units and complete question
 	assert.deepEqual(direction.questions.slice(0, 4).map((question) => question.id), ["correction_needed", "primary_concern", "evidence_anchor", "requirement_focus"]);
 	assert.match(direction.questions[0]?.instructions ?? "", /INSUFFICIENT_EVIDENCE/);
 	assert.equal(run.fixture.executed.includes("write_toy"), true, "productive proposal remains unblocked");
+	assert.equal(run.summary?.finalStatus, "UNRESOLVED", "unknown global coverage cannot certify completion");
+});
+
+test("tuned adapter skips an oversize protected proposal instead of invoking clipping fallback", async (t) => {
+	const large = `begin-${"中".repeat(12_000)}-end`;
+	const run = await runFixture(t, {
+		mode: "observe",
+		direction: ["PROCEED"],
+		prompts: ["Write the supplied content exactly."],
+		tuning: { enabled: true, selector: "s2", softPayloadBytes: 4096, proposalEvery: 1, completionEnabled: true, cooldownCheckpoints: 0 },
+		script: [
+			fauxAssistantMessage([fauxToolCall("write_toy", { path: "large.txt", text: large }, { id: "call-large" })]),
+			fauxAssistantMessage("Completed the requested write."),
+		],
+	});
+	assert.equal(run.sent.some((item) => item.kind === "direction"), false, "no partial direction packet is assessed");
+	assert.equal(run.fixture.executed.includes("write_toy"), true, "unchecked context passes through without blocking");
+	const skipped = ofType(run.events, "assessment_skipped").find((event) => event.kind === "direction");
+	assert.equal(skipped?.reason, "UNCHECKED_CONTEXT");
+	assert.equal(skipped?.protectedMaterialPreserved, true);
+});
+
+test("strong tuned guidance is delivered only when the next actor context contains it", async (t) => {
+	const run = await runFixture(t, {
+		mode: "enforce",
+		direction: ["PROCEED", "PROCEED"],
+		tuned: ["none", "strong"],
+		prompts: ["Read notes.txt, then write a result that preserves the request."],
+		tuning: { enabled: true, selector: "s2", softPayloadBytes: 24576, proposalEvery: 1, completionEnabled: true, cooldownCheckpoints: 0 },
+		script: [
+			fauxAssistantMessage([fauxToolCall("read_toy", { path: "notes.txt" }, { id: "call-read-first" })]),
+			fauxAssistantMessage([fauxToolCall("write_toy", { path: "notes.txt", text: "replacement" }, { id: "call-write-second" })]),
+			fauxAssistantMessage("Stopped after the supervisor correction."),
+		],
+	});
+	assert.deepEqual(run.fixture.executed, ["read_toy"], `the grounded second proposal is blocked before execution: ${JSON.stringify(ofType(run.events, "direction_assessment"))}`);
+	const lifecycle = ofType(run.events, "intervention.lifecycle").filter((event) => event.action === "strong");
+	assert.deepEqual(lifecycle.map((event) => event.stage).slice(0, 4), ["selected", "applied", "queued", "delivered"]);
+	assert.equal(lifecycle[3]?.basis, "next_actor_context_contains_guidance");
+	assert.ok(run.probe.requests.some((request) => request.texts.some((text) => text.includes("Concern:") && text.includes("Exit check:"))), "the actor request contains the evidence-linked guidance");
 });
 
 function fixtureNetworkClean(fixture: { networkAttempts: string[] }): boolean {

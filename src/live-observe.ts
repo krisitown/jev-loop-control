@@ -62,10 +62,13 @@ interface LiveState {
 	lastScheduledEvidenceHash: string | undefined;
 	checkpointsSinceAssessment: number;
 	respondedConcernKeys: Set<string>;
+	pendingDeliveryActions: Map<string, "soft" | "strong" | "completion">;
 }
 
 /** Our own injected guidance message; the context hook drops nothing else. */
 const GUIDANCE_CUSTOM_TYPE = "jev-loop-control.recovery-guidance";
+/** Keeps tuned packets below the transport's documented conservative total estimate. */
+const TUNED_CONSERVATIVE_WIRE_BYTES = 64_000;
 
 export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClient; fetchImpl?: typeof fetch }): void {
 	let state: LiveState | undefined;
@@ -200,6 +203,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			lastScheduledEvidenceHash: undefined,
 			checkpointsSinceAssessment: Number.POSITIVE_INFINITY,
 			respondedConcernKeys: new Set(),
+			pendingDeliveryActions: new Map(),
 		};
 
 		activation.reason = "";
@@ -366,20 +370,26 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			s.checkpointsSinceAssessment = 0;
 		}
 
+		const tunedWireTarget = Math.min(s.config.tuning.softPayloadBytes, s.config.jev.maxRequestBytes, TUNED_CONSERVATIVE_WIRE_BYTES);
 		let tunedPacket = s.config.tuning.enabled
 			? buildAssessmentPacket(ledgerFromSnapshot(snapshot), {
 				selector: s.config.tuning.selector,
-				softPayloadBytes: s.config.tuning.softPayloadBytes,
+				softPayloadBytes: tunedWireTarget,
 				assessmentScope: { kind: "proposal", targetId: `proposal:${snapshot.target.proposalHash}` },
 			})
 			: null;
 		let questions = tunedPacket ? buildCorrectionQuestions(tunedPacket.packet) : buildQuestions("direction", snapshot);
 		if (tunedPacket) {
 			const firstEnvelope = buildRequestBody({ model: s.config.jev.model, state: tunedPacket.packet as unknown as Record<string, unknown>, questions });
-			if (firstEnvelope.bytes > s.config.tuning.softPayloadBytes) {
-				const reducedPacketTarget = Math.max(1024, s.config.tuning.softPayloadBytes - (firstEnvelope.bytes - tunedPacket.serializedBytes));
+			if (firstEnvelope.bytes > tunedWireTarget) {
+				const reducedPacketTarget = Math.max(1024, tunedWireTarget - (firstEnvelope.bytes - tunedPacket.serializedBytes));
 				tunedPacket = buildAssessmentPacket(ledgerFromSnapshot(snapshot), { selector: s.config.tuning.selector, softPayloadBytes: reducedPacketTarget, assessmentScope: { kind: "proposal", targetId: `proposal:${snapshot.target.proposalHash}` } });
 				questions = buildCorrectionQuestions(tunedPacket.packet);
+			}
+			const finalEnvelope = buildRequestBody({ model: s.config.jev.model, state: tunedPacket.packet as unknown as Record<string, unknown>, questions });
+			if (tunedPacket.overSoftTarget || finalEnvelope.bytes > tunedWireTarget) {
+				s.trace.record("assessment_skipped", { reason: "UNCHECKED_CONTEXT", kind: "direction", proposalId: s.proposalId, packetBytes: tunedPacket.serializedBytes, requestBytes: finalEnvelope.bytes, wireTargetBytes: tunedWireTarget, protectedMaterialPreserved: true });
+				return undefined;
 			}
 		}
 		const controller = {
@@ -522,14 +532,20 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 					s.lastScheduledEvidenceHash = snapshot.scope.snapshotHash;
 					s.checkpointsSinceAssessment = 0;
 				}
-				let tunedPacket = s.config.tuning.enabled ? buildAssessmentPacket(ledgerFromSnapshot(snapshot), { selector: s.config.tuning.selector, softPayloadBytes: s.config.tuning.softPayloadBytes, assessmentScope: { kind: "completion", targetId: `proposal:${snapshot.target.proposalHash}` } }) : null;
+				const tunedWireTarget = Math.min(s.config.tuning.softPayloadBytes, s.config.jev.maxRequestBytes, TUNED_CONSERVATIVE_WIRE_BYTES);
+				let tunedPacket = s.config.tuning.enabled ? buildAssessmentPacket(ledgerFromSnapshot(snapshot), { selector: s.config.tuning.selector, softPayloadBytes: tunedWireTarget, assessmentScope: { kind: "completion", targetId: `proposal:${snapshot.target.proposalHash}` } }) : null;
 				let questions = tunedPacket ? buildCompletionQuestions(tunedPacket.packet) : buildQuestions("completion", snapshot);
 				if (tunedPacket) {
 					const firstEnvelope = buildRequestBody({ model: s.config.jev.model, state: tunedPacket.packet as unknown as Record<string, unknown>, questions });
-					if (firstEnvelope.bytes > s.config.tuning.softPayloadBytes) {
-						const reducedPacketTarget = Math.max(1024, s.config.tuning.softPayloadBytes - (firstEnvelope.bytes - tunedPacket.serializedBytes));
+					if (firstEnvelope.bytes > tunedWireTarget) {
+						const reducedPacketTarget = Math.max(1024, tunedWireTarget - (firstEnvelope.bytes - tunedPacket.serializedBytes));
 						tunedPacket = buildAssessmentPacket(ledgerFromSnapshot(snapshot), { selector: s.config.tuning.selector, softPayloadBytes: reducedPacketTarget, assessmentScope: { kind: "completion", targetId: `proposal:${snapshot.target.proposalHash}` } });
 						questions = buildCompletionQuestions(tunedPacket.packet);
+					}
+					const finalEnvelope = buildRequestBody({ model: s.config.jev.model, state: tunedPacket.packet as unknown as Record<string, unknown>, questions });
+					if (tunedPacket.overSoftTarget || finalEnvelope.bytes > tunedWireTarget) {
+						s.trace.record("assessment_skipped", { reason: "UNCHECKED_CONTEXT", kind: "completion", proposalId: s.proposalId, packetBytes: tunedPacket.serializedBytes, requestBytes: finalEnvelope.bytes, wireTargetBytes: tunedWireTarget, protectedMaterialPreserved: true });
+						return;
 					}
 				}
 				const controller = {
@@ -671,6 +687,8 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 					s.completionDecision = undefined;
 					return undefined;
 				}
+				s.pendingDeliveryActions.set(decision.focusKey, "completion");
+				for (const stage of ["selected", "applied", "queued"]) s.trace.record("intervention.lifecycle", { stage, action: "completion", concernId: decision.focusKey, proposalId: s.proposalId, requestId: decision.assessment.requestId });
 			}
 			s.interventionsUsed++;
 			s.terminalContinuationsUsed++;
@@ -754,7 +772,11 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 					proposalId: s.proposalId,
 					content: instruction,
 				});
-				s.trace.record("intervention.lifecycle", { stage: "delivered", action: "soft", concernId: s.recovery.active.focusKey, proposalId: s.proposalId });
+				const action = s.pendingDeliveryActions.get(s.recovery.active.focusKey);
+				if (action) {
+					s.trace.record("intervention.lifecycle", { stage: "delivered", action, concernId: s.recovery.active.focusKey, proposalId: s.proposalId, basis: "next_actor_context_contains_guidance" });
+					s.pendingDeliveryActions.delete(s.recovery.active.focusKey);
+				}
 			}
 		}
 		else {
@@ -870,6 +892,7 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			s.lastFocusKey = decision.focusKey;
 			s.newEvidence = false;
 			for (const stage of ["selected", "applied", "queued"]) s.trace.record("intervention.lifecycle", { stage, action: "soft", concernId: decision.focusKey, proposalId: s.proposalId, requestId: decision.assessment.requestId });
+			s.pendingDeliveryActions.set(decision.focusKey, "soft");
 			return undefined;
 		}
 		if (decision && decision.apply === "block" && s.config.mode === "enforce" && s.trace.enabled && !ctx.signal?.aborted && (cap === null || s.interventionsUsed < cap)) {
@@ -898,7 +921,8 @@ export function liveObserve(pi: ExtensionAPI, dependencies?: { client?: JevClien
 			s.interventionsUsed++;
 			s.lastFocusKey = decision.focusKey;
 			s.newEvidence = false;
-			for (const stage of ["selected", "applied", "delivered"]) s.trace.record("intervention.lifecycle", { stage, action: "strong", concernId: decision.focusKey, proposalId: s.proposalId, requestId: decision.assessment.requestId });
+			for (const stage of ["selected", "applied", "queued"]) s.trace.record("intervention.lifecycle", { stage, action: "strong", concernId: decision.focusKey, proposalId: s.proposalId, requestId: decision.assessment.requestId });
+			if (decision.focusKey) s.pendingDeliveryActions.set(decision.focusKey, "strong");
 			s.trace.record("intervention.block", {
 				toolCallId: event.toolCallId,
 				toolName: event.toolName,

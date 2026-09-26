@@ -41,6 +41,7 @@ test("questions stay intact and expose every retained neutral source id", () => 
 	const questions = buildCorrectionQuestions(packet);
 	assert.deepEqual(questions.map((q) => q.id), ["correction_needed", "primary_concern", "evidence_anchor", "requirement_focus"]);
 	const anchor = questions[2]!;
+	assert.ok("p1" in anchor.criteria, "the exact proposal can anchor a proposal-versus-contract concern");
 	assert.ok("e1" in anchor.criteria);
 	assert.match(questions[0]!.instructions, /INSUFFICIENT_EVIDENCE/);
 });
@@ -72,6 +73,23 @@ test("strong action requires supported grounding and a qualifying concern", () =
 	const profile = { softThreshold: .62, strongThreshold: .84, softMinGap: .12, strongMinGap: .24, strongConcerns: ["CONTRACT_CONTRADICTION"] };
 	assert.equal(evaluateCorrectionPolicy(base, profile).action, "strong");
 	assert.equal(evaluateCorrectionPolicy({ ...base, availableAnchorIds: [] }, profile).suppressionReason, "unsupported_grounding");
+	const diffuseAuxiliary = {
+		...base,
+		concern: { choice: "CONTRACT_CONTRADICTION", probabilities: { CONTRACT_CONTRADICTION: .31, CONTRADICTED_DIAGNOSIS: .29, NONE: .2, INSUFFICIENT_EVIDENCE: .2 } },
+		anchor: { choice: "e1", probabilities: { e1: .4, e2: .35, NONE: .15, UNKNOWN: .1 } },
+	};
+	const downgraded = evaluateCorrectionPolicy(diffuseAuxiliary, profile);
+	assert.equal(downgraded.action, "soft", "ambiguous auxiliary selections cannot hard-block");
+	assert.equal(downgraded.strongGrounding, false);
+});
+
+test("protected material that exceeds the target stays whole and reports oversize", () => {
+	const value = ledger();
+	value.proposals[0]!.text = `start-${"λ".repeat(10_000)}-end`;
+	const result = buildAssessmentPacket(value, { selector: "s2", softPayloadBytes: 4096, assessmentScope: { kind: "proposal", targetId: "p1" } });
+	assert.equal(result.overSoftTarget, true);
+	assert.equal(result.packet.current_proposal?.text, value.proposals[0]!.text);
+	assert.doesNotMatch(result.serialized, /clipped|elided/);
 });
 
 test("productive proposal is not converted into a correction", () => {
