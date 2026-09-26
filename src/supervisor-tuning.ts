@@ -16,6 +16,8 @@ export interface EvidenceUnit {
 	protected?: boolean;
 	supersedes?: string[];
 	status?: "open" | "resolved" | "unknown";
+	/** Factual fold of exact-identical duplicate occurrences (equal output can come from distinct argument hashes); the representative keeps its own complete original text. */
+	occurrences?: { count: number; retained: Array<{ id: string; source: string; at?: string; references?: string[] }>; omitted: number };
 }
 
 export interface EvidenceLedger {
@@ -93,6 +95,33 @@ function newestFirst(a: EvidenceUnit, b: EvidenceUnit): number {
 	return (b.at ?? "").localeCompare(a.at ?? "") || a.id.localeCompare(b.id);
 }
 
+/** Exact-identical observation.text duplicates transmit once; near-identical and normalized-equal texts stay distinct. A group containing any protected unit is never folded, so mandatory original ids always survive. */
+function foldDuplicateObservations(observations: EvidenceUnit[]): EvidenceUnit[] {
+	const groups = new Map<string, EvidenceUnit[]>();
+	for (const unit of observations) {
+		const bucket = groups.get(unit.text);
+		if (bucket) bucket.push(unit); else groups.set(unit.text, [unit]);
+	}
+	return [...groups.entries()].flatMap(([text, group]): EvidenceUnit[] => {
+		if (group.length < 2) return [group[0]!];
+		// The mandatory set is built from original unit ids, so folding a group
+		// that contains any protected member could drop a mandatory evidence id
+		// from the packet. Such groups transmit every original unit unchanged.
+		if (group.some((unit) => unit.protected)) return group;
+		// With no timestamps there is no recency signal; input order is the only
+		// ordering left, so the last occurrence represents the group.
+		const ordered = group.every((unit) => unit.at) ? [...group].sort(newestFirst) : [...group].reverse();
+		const representative = ordered[0]!;
+		// Each retained occurrence keeps its own references copy: equal text can
+		// come from distinct arguments hashes, and mutating one clone must never
+		// change another occurrence or the untouched ledger input.
+		const retained = ordered.slice(0, 12).map(({ id, source, at, references }) => ({ id, source, ...(at === undefined ? {} : { at }), ...(references ? { references: [...references] } : {}) }));
+		// Shallow-clone the representative so its references array stays independent
+		// of the ledger unit; ledger inputs stay untouched.
+		return [{ ...representative, ...(representative.references ? { references: [...representative.references] } : {}), occurrences: { count: group.length, retained, omitted: group.length - retained.length } }];
+	}).filter((unit) => unit.text !== "");
+}
+
 function bytes(value: unknown): number {
 	return Buffer.byteLength(JSON.stringify(value), "utf8");
 }
@@ -147,7 +176,7 @@ export function buildAssessmentPacket(ledger: EvidenceLedger, options: PacketBui
 		seenRequirementText.add(normalized); return true;
 	});
 	const rankedRequirements = uniqueRequirements.map((unit) => ({ unit, score: relevance(unit, query) })).sort((a, b) => b.score - a.score || newestFirst(a.unit, b.unit));
-	const rankedEvidence = ledger.observations.map((unit) => ({ unit, score: relevance(unit, query) })).sort((a, b) => b.score - a.score || newestFirst(a.unit, b.unit));
+	const rankedEvidence = foldDuplicateObservations(ledger.observations).map((unit) => ({ unit, score: relevance(unit, query) })).sort((a, b) => b.score - a.score || newestFirst(a.unit, b.unit));
 	const rankedTrajectory = (ledger.trajectory ?? []).map((unit) => ({ unit, score: relevance(unit, query) })).sort((a, b) => b.score - a.score || newestFirst(a.unit, b.unit));
 	const rankedConcerns = (ledger.concerns ?? []).filter((unit) => unit.status !== "resolved").map((unit) => ({ unit, score: relevance(unit, query) })).sort((a, b) => b.score - a.score || newestFirst(a.unit, b.unit));
 

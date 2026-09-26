@@ -52,6 +52,91 @@ test("S2 protects exact proposal and relevant units within a serialized-byte tar
 	assert.ok(result.serializedBytes <= 4096);
 });
 
+test("100 exact-identical observations transmit one complete body with truthful occurrence metadata", () => {
+	const value = ledger();
+	value.observations = Array.from({ length: 100 }, (_, index) => ({
+		id: `dup-${index}`,
+		kind: "observation" as const,
+		text: "watchdog: rate limit exceeded, retrying the same request",
+		source: `tool:retry${index}`,
+		at: `2026-01-01T00:0${index < 60 ? 0 : 1}:${String(index % 60).padStart(2, "0")}.000Z`,
+	}));
+	const frozen = structuredClone(value.observations);
+	const built = buildAssessmentPacket(value, { selector: "s2", softPayloadBytes: 4096, assessmentScope: { kind: "proposal", targetId: "p1" } });
+	assert.deepEqual(value.observations, frozen, "the ledger input is never mutated by folding");
+	const transmitted = built.serialized.split("watchdog: rate limit exceeded, retrying the same request").length - 1;
+	assert.equal(transmitted, 1, "exact duplicates share one complete transmitted body");
+	const representative = built.packet.recent_evidence.find((unit) => unit.occurrences)!;
+	assert.equal(representative.text, frozen[99]!.text, "the representative keeps the complete original text");
+	assert.equal(representative.id, "dup-99", "the latest occurrence represents the group");
+	assert.equal(representative.source, "tool:retry99");
+	assert.equal(representative.occurrences!.count, 100);
+	assert.equal(representative.occurrences!.retained.length, 12);
+	assert.equal(representative.occurrences!.omitted, 88);
+	assert.deepEqual(representative.occurrences!.retained[0], { id: "dup-99", source: "tool:retry99", at: "2026-01-01T00:01:39.000Z" }, "occurrences without references gain no references key");
+	assert.deepEqual(representative.occurrences!.retained.map((item) => item.id), Array.from({ length: 12 }, (_, i) => `dup-${99 - i}`), "retained lists the latest occurrences first");
+	assert.equal(built.packet.selection.filter((item) => item.id.startsWith("dup-") && item.included).length, 1, "only the representative is selectable");
+	const ids = [...built.packet.recent_evidence, ...built.packet.trajectory].map((unit) => unit.id);
+	assert.equal(new Set(ids).size, ids.length, "no duplicate anchor ids");
+});
+
+test("near-identical unicode observation outputs stay distinct", () => {
+	const value = ledger();
+	value.observations = [
+		// Literals keep the three texts genuinely distinct: u1 is the composed
+		// preformed e-acute (U+00E9), u2 is decomposed e + combining acute
+		// (U+0065 U+0301) — NFC-equal but not byte-identical — and u3 differs
+		// in spacing only.
+		{ id: "u1", kind: "observation", text: "dohn\u00e9 \u03a9", source: "tool:u1" },
+		{ id: "u2", kind: "observation", text: "dohne\u0301 Ω", source: "tool:u2" },
+		{ id: "u3", kind: "observation", text: "dohne  Ω", source: "tool:u3" },
+	];
+	const packet = buildAssessmentPacket(value, { selector: "s2", softPayloadBytes: 4096, assessmentScope: { kind: "proposal", targetId: "p1" } }).packet;
+	assert.deepEqual(packet.recent_evidence.filter((unit) => unit.id.startsWith("u")).map((unit) => unit.id), ["u1", "u2", "u3"], "no normalization or fuzzy folding");
+	assert.equal(packet.recent_evidence.some((unit) => unit.occurrences), false, "a single-occurrence group gains no metadata");
+});
+
+test("exact duplicates without timestamps let the latest input occurrence represent the group", () => {
+	const value = ledger();
+	value.observations = [
+		{ id: "m1", kind: "observation", text: "same diagnostic", source: "tool:m1", references: ["args-1"] },
+		{ id: "m2", kind: "observation", text: "same diagnostic", source: "tool:m2", references: ["args-2"] },
+		{ id: "m3", kind: "observation", text: "same diagnostic", source: "tool:m3", references: ["args-3"] },
+	];
+	const frozen = structuredClone(value.observations);
+	const packet = buildAssessmentPacket(value, { selector: "s2", softPayloadBytes: 4096, assessmentScope: { kind: "proposal", targetId: "p1" } }).packet;
+	const representative = packet.recent_evidence.find((unit) => unit.occurrences)!;
+	assert.equal(representative.id, "m3", "with no timestamps the last input occurrence represents the group");
+	assert.equal(representative.source, "tool:m3");
+	assert.equal(representative.occurrences!.count, 3);
+	assert.deepEqual(representative.occurrences!.retained.map((item) => item.id), ["m3", "m2", "m1"], "retained starts with the latest occurrence");
+	assert.deepEqual(representative.occurrences!.retained.map((item) => "at" in item), [false, false, false], "absent timestamps stay absent in retained metadata");
+	assert.deepEqual(representative.occurrences!.retained.map((item) => item.references), [["args-3"], ["args-2"], ["args-1"]], "equal text can come from distinct arguments hashes, so each retained occurrence keeps its own references copy");
+	representative.occurrences!.retained[0]!.references!.push("mutated");
+	assert.deepEqual(value.observations, frozen, "mutating a retained copy never reaches the ledger input");
+	assert.deepEqual(representative.references, ["args-3"], "a duplicate labels repeat occurrences, not distinct argument hashes already carried as references");
+	assert.equal(packet.selection.filter((item) => item.id.startsWith("m") && item.included).length, 1, "only the representative is selectable");
+});
+
+test("a protected observation is never folded away by a later identical duplicate", () => {
+	const value = ledger();
+	value.observations = [
+		{ id: "prot", kind: "observation", text: "watchdog: rate limit exceeded", source: "tool:protected", at: "2026-01-01T00:00:01.000Z", protected: true },
+		{ id: "later", kind: "observation", text: "watchdog: rate limit exceeded", source: "tool:later", at: "2026-01-01T00:00:09.000Z" },
+	];
+	const built = buildAssessmentPacket(value, { selector: "s2", softPayloadBytes: 4096, assessmentScope: { kind: "proposal", targetId: "p1" } });
+	const protectedUnit = built.packet.recent_evidence.find((unit) => unit.id === "prot");
+	assert.ok(protectedUnit, "the mandatory protected id survives even when a newer unit repeats its text verbatim");
+	assert.equal(protectedUnit!.text, "watchdog: rate limit exceeded", "the protected unit keeps its complete body");
+	assert.equal(protectedUnit!.source, "tool:protected");
+	assert.equal(protectedUnit!.protected, true, "the protected flag is preserved on the transmitted unit");
+	assert.equal(protectedUnit!.occurrences, undefined, "an unfolded protected group gains no occurrence metadata");
+	assert.ok(built.packet.recent_evidence.some((unit) => unit.id === "later"), "the duplicate is transmitted as its own original unit too");
+	assert.equal(built.serialized.split("watchdog: rate limit exceeded").length - 1, 2, "mandatory ids outweigh one duplicate body saving");
+	assert.equal(built.packet.selection.find((item) => item.id === "prot")?.reason, "protected");
+	assert.equal(built.overSoftTarget, false);
+});
+
 test("missing target is explicit insufficient coverage", () => {
 	const result = buildAssessmentPacket(ledger(), { selector: "s1", softPayloadBytes: 4096, assessmentScope: { kind: "proposal", targetId: "missing" } });
 	assert.equal(result.packet.current_proposal, null);

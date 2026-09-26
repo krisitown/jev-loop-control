@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0-dev.15 - 2026-09-26
+
+- Sends exact-identical observation output once in experimental tuning packets,
+  with the latest original source and bounded occurrence/provenance metadata.
+  Near-identical Unicode stays distinct; protected evidence IDs remain intact.
+- Development checkpoint only. Questions and action thresholds are unchanged.
+  Repetition detection, stale evidence handling, and campaign effectiveness
+  remain unqualified; deduplication is not a semantic judgment about tool use.
+
 ## 0.4.0-dev.14 - 2026-09-26
 
 - Keeps a concern open after its bounded guidance lease expires until a grounded
