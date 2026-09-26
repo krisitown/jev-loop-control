@@ -5,6 +5,14 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
+## 0.4.0-dev.12 - 2026-09-26
+
+- Adds a real-Pi adapter regression for soft tuned guidance: the assessed tool
+  still executes, while the source-linked memo reaches the next outbound actor
+  request before delivery is recorded.
+- Test and package-metadata checkpoint only. Production source is byte-identical
+  to dev11; hosted effectiveness and real actor resolution remain separate gates.
+
 ## 0.4.0-dev.11 - 2026-09-26
 
 - Retains every sanitized user instruction locally with chronological provenance

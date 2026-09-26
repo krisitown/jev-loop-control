@@ -51,7 +51,7 @@ interface RunResult {
 }
 
 /** Answers scripted per direction request; completion is always MET/COMPLETE. */
-function fakeClient(script: { direction: Array<"VERIFY" | "PROCEED">; tuned?: Array<"none" | "strong"> }, sent: RunResult["sent"]): JevClient {
+function fakeClient(script: { direction: Array<"VERIFY" | "PROCEED">; tuned?: Array<"none" | "soft" | "strong"> }, sent: RunResult["sent"]): JevClient {
 	let directionIndex = 0;
 	const scrub = makeScrub([FAKE_KEY]);
 	return {
@@ -61,6 +61,7 @@ function fakeClient(script: { direction: Array<"VERIFY" | "PROCEED">; tuned?: Ar
 			if (kind === "direction") directionIndex++;
 			const legacyVerdict = script.direction[Math.min(index, script.direction.length - 1)] ?? "PROCEED";
 			const tunedVerdict = script.tuned?.[Math.min(index, script.tuned.length - 1)] ?? "none";
+			const tunedCorrection = tunedVerdict !== "none";
 			const answers: Record<string, Assessment["answers"][string]> = {};
 			for (const question of questions) {
 				if (question.type === "noul") {
@@ -79,17 +80,17 @@ function fakeClient(script: { direction: Array<"VERIFY" | "PROCEED">; tuned?: Ar
 				else if (question.role === "focus_requirement") {
 					selected = question.criteria.R1 === undefined ? "NONE" : "R1";
 				}
-				else if (question.role === "correction_needed") selected = tunedVerdict === "strong" ? "CORRECTION_JUSTIFIED" : "NO_CORRECTION_JUSTIFIED";
-				else if (question.role === "primary_concern") selected = tunedVerdict === "strong" ? "CONTRACT_CONTRADICTION" : "NONE";
-				else if (question.role === "evidence_anchor") selected = tunedVerdict === "strong" ? (Object.keys(question.criteria).find((id) => id !== "NONE" && id !== "UNKNOWN") ?? "UNKNOWN") : "NONE";
-				else if (question.role === "requirement_focus") selected = tunedVerdict === "strong" ? (Object.keys(question.criteria).find((id) => !["PROCESS", "NONE", "UNKNOWN"].includes(id)) ?? "UNKNOWN") : "NONE";
+				else if (question.role === "correction_needed") selected = tunedCorrection ? "CORRECTION_JUSTIFIED" : "NO_CORRECTION_JUSTIFIED";
+				else if (question.role === "primary_concern") selected = tunedCorrection ? "CONTRACT_CONTRADICTION" : "NONE";
+				else if (question.role === "evidence_anchor") selected = tunedCorrection ? (Object.keys(question.criteria).find((id) => id !== "NONE" && id !== "UNKNOWN") ?? "UNKNOWN") : "NONE";
+				else if (question.role === "requirement_focus") selected = tunedCorrection ? (Object.keys(question.criteria).find((id) => !["PROCESS", "NONE", "UNKNOWN"].includes(id)) ?? "UNKNOWN") : "NONE";
 				else if (question.role === "completion_status") selected = "SUPPORTED";
 				else if (question.role === "concern_outcome") selected = "UNKNOWN";
 				answers[question.id] = {
 					type: "choice",
 					questionId: question.id,
 					choice: selected,
-					probabilities: weightsFor(question, selected, 0.9),
+					probabilities: weightsFor(question, selected, question.role === "correction_needed" && tunedVerdict === "soft" ? 0.7 : 0.9),
 					confidence: 0.9,
 				};
 			}
@@ -166,7 +167,7 @@ async function runFixture(
 		prompts: string[];
 		script?: FixtureOptions["script"];
 		tuning?: Record<string, unknown>;
-		tuned?: Array<"none" | "strong">;
+		tuned?: Array<"none" | "soft" | "strong">;
 	},
 ): Promise<RunResult> {
 	const supervisorDir = mkdtempSync(join(tmpdir(), "jev-live-config-"));
@@ -327,6 +328,26 @@ test("strong tuned guidance is delivered only when the next actor context contai
 	assert.deepEqual(lifecycle.map((event) => event.stage).slice(0, 4), ["selected", "applied", "queued", "delivered"]);
 	assert.equal(lifecycle[3]?.basis, "next_actor_context_contains_guidance");
 	assert.ok(run.probe.requests.some((request) => request.texts.some((text) => text.includes("Concern:") && text.includes("Exit check:"))), "the actor request contains the evidence-linked guidance");
+});
+
+test("soft tuned guidance lets the current tool execute and reaches the next actor request", async (t) => {
+	const run = await runFixture(t, {
+		mode: "enforce",
+		direction: ["PROCEED", "PROCEED"],
+		tuned: ["soft", "none"],
+		prompts: ["Read notes.txt, then continue with the requirement."],
+		tuning: { enabled: true, selector: "s2", softPayloadBytes: 24576, softThreshold: 0.65, softMinGap: 0.1, strongThreshold: 0.85, strongMinGap: 0.2, proposalEvery: 1, completionEnabled: true, cooldownCheckpoints: 0 },
+		script: [
+			fauxAssistantMessage([fauxToolCall("read_toy", { path: "notes.txt" }, { id: "call-soft-read" })]),
+			fauxAssistantMessage([fauxToolCall("write_toy", { path: "notes.txt", text: "corrected" }, { id: "call-after-soft" })]),
+			fauxAssistantMessage("Finished after following the supervisor guidance."),
+		],
+	});
+	assert.deepEqual(run.fixture.executed, ["read_toy", "write_toy"], "soft advice does not retroactively block the assessed tool");
+	const lifecycle = ofType(run.events, "intervention.lifecycle").filter((event) => event.action === "soft");
+	assert.deepEqual(lifecycle.map((event) => event.stage).slice(0, 4), ["selected", "applied", "queued", "delivered"]);
+	assert.equal(lifecycle[3]?.basis, "next_actor_context_contains_guidance");
+	assert.ok(run.probe.requests.slice(1).some((request) => request.texts.some((text) => text.includes("Concern:") && text.includes("Exit check:"))), "the next outbound actor request contains the soft memo");
 });
 
 function fixtureNetworkClean(fixture: { networkAttempts: string[] }): boolean {
