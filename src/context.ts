@@ -1,5 +1,35 @@
 import { Buffer } from 'buffer';
 
+export interface RequirementTextSource {
+  id: string;
+  summary: string;
+}
+
+/** Replace exact large manifest text while preserving the source reference. */
+export function deduplicateUserText(
+  text: string,
+  requirements: readonly RequirementTextSource[]
+): { text: string; deduplicatedChars: number; references: string[] } {
+  const candidates = requirements
+    .filter((requirement) => requirement.summary && requirement.summary.length >= 80)
+    .sort((a, b) => b.summary.length - a.summary.length);
+  let result = text;
+  let deduplicatedChars = 0;
+  const references: string[] = [];
+  for (const requirement of candidates) {
+    if (!result.includes(requirement.summary)) continue;
+    const replacement = `[See task.requirements ${requirement.id}]`;
+    const removed = requirement.summary.length - replacement.length;
+    if (removed <= 0) continue;
+    const count = result.split(requirement.summary).length - 1;
+    if (count <= 0) continue;
+    result = result.split(requirement.summary).join(replacement);
+    deduplicatedChars += removed * count;
+    references.push(requirement.id);
+  }
+  return { text: result, deduplicatedChars, references: [...new Set(references)] };
+}
+
 export function pruneContext(
   rep: Record<string, any>,
   turns: Array<{ role: string; text: string }>,
@@ -17,30 +47,15 @@ export function pruneContext(
 
   // Step 1: Deduplicate USER text by replacing full requirement summaries >= 80 chars, longest first
   const requirements = clonedRep.requirements || [];
-  const reqSummaries = requirements
-    .filter((r: any) => r.summary && r.summary.length >= 80)
-    .map((r: any) => ({ id: r.id, summary: r.summary }))
-    .sort((a: any, b: any) => b.summary.length - a.summary.length);
-
   let deduplicatedChars = 0;
   const dedupedTurns: Array<{ role: string; text: string }> = [];
 
   for (const turn of clonedTurns) {
     let newText = turn.text;
     if (turn.role === 'user') {
-      for (const req of reqSummaries) {
-        if (newText.includes(req.summary)) {
-          const replacement = `[See task.requirements ${req.id}]`;
-          const removed = req.summary.length - replacement.length;
-          if (removed > 0) {
-            const count = newText.split(req.summary).length - 1;
-            if (count > 0) {
-              newText = newText.split(req.summary).join(replacement);
-              deduplicatedChars += removed * count;
-            }
-          }
-        }
-      }
+      const deduplicated = deduplicateUserText(newText, requirements);
+      newText = deduplicated.text;
+      deduplicatedChars += deduplicated.deduplicatedChars;
     }
     dedupedTurns.push({ role: turn.role, text: newText });
   }

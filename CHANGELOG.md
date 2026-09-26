@@ -5,6 +5,17 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
+## 0.4.0-dev.11 - 2026-09-26
+
+- Retains every sanitized user instruction locally with chronological provenance
+  and carries later instructions into tuned packet selection as source units.
+- Reuses exact manifest-text deduplication for transported user turns, preserving
+  source references and coverage without duplicating large cumulative prompts.
+- Makes no semantic supersession inference; relevance, recency, exact deduplication,
+  and packet bounds select among the original instruction units.
+- Development checkpoint only. User-amendment semantics still require independent
+  live validation before campaign readiness.
+
 ## 0.4.0-dev.10 - 2026-09-26
 
 - Aligns the package and lockfile version metadata so an isolated Git-package

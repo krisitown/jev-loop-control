@@ -34,7 +34,7 @@ import type {
 	SnapshotToolCall,
 } from "./types.ts";
 import type { SupervisorConfig } from "./config.ts";
-import { pruneContext } from "./context.ts";
+import { deduplicateUserText, pruneContext } from "./context.ts";
 
 /** Minimal structural view of a Pi message; avoids importing Pi types here. */
 export interface Msg {
@@ -547,12 +547,26 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 	// be bounded, the MOST RECENT turns are kept (the oldest content is dropped),
 	// never a fixed prefix of the transcript.
 	const historyTurns: HistoryTurn[] = [];
-	for (const message of input.messages) {
+	const sourceUserInstructions: NonNullable<EvidenceSnapshot["sourceUserInstructions"]> = [];
+	let userOrdinal = 0;
+	for (const [order, message] of input.messages.entries()) {
 		if (message === input.target) continue;
 		if (message.role !== "assistant" && message.role !== "user") continue;
 		const text = scrub(visibleText(message));
 		if (text) {
 			historyTurns.push({ role: message.role, text });
+			if (message.role === "user") {
+				userOrdinal++;
+				const transport = deduplicateUserText(text, input.requirements);
+				sourceUserInstructions.push({
+					id: `user_instruction:${String(userOrdinal).padStart(4, "0")}`,
+					text,
+					transportText: transport.text,
+					source: refOf(message, input.messages, scrub),
+					order,
+					...(transport.references.length > 0 ? { references: transport.references } : {}),
+				});
+			}
 		}
 	}
 	const historyBudget = Math.max(0, input.config.limits.maxEvidenceChars - HISTORY_LABEL_OVERHEAD * Math.max(1, historyTurns.length));
@@ -651,6 +665,7 @@ export function buildSnapshot(input: SnapshotInput): EvidenceSnapshot {
 		toolCalls,
 		observations: representation.observations as SnapshotObservation[],
 		sourceObservations,
+		sourceUserInstructions,
 		priorInterventions,
 		facts,
 		scope: { ...input.scope, snapshotHash },

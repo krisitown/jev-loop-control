@@ -241,6 +241,8 @@ export interface EvidenceSnapshot {
 	observations: SnapshotObservation[];
 	/** Complete sanitized local source text for packet selection; never serialized wholesale. */
 	sourceObservations?: Array<{ id: string; text: string; source: string }>;
+	/** Complete sanitized user turns plus their manifest-deduplicated transport form. */
+	sourceUserInstructions?: Array<{ id: string; text: string; transportText: string; source: string; order: number; references?: string[] }>;
 	priorInterventions: Array<{ kind: string; at: string; focus: string }>;
 	facts: DeterministicFact[];
 	scope: { sessionId: string; taskId: string; branch: string; snapshotHash: string };

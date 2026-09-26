@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { defaultConfig } from "../src/config.ts";
+import { buildSnapshot, type Msg } from "../src/evidence.ts";
 import { buildRequestBody } from "../src/jev.ts";
 import { buildAssessmentPacket, buildCompletionQuestions, buildCorrectionQuestions, CORRECTION_QUESTION_VERSION, decideCorrectionAssessment, evaluateCorrectionPolicy, ledgerFromSnapshot, LifecycleTracker, shouldScheduleCheckpoint, type EvidenceLedger } from "../src/supervisor-tuning.ts";
 import type { Answer, Assessment, EvidenceSnapshot } from "../src/types.ts";
@@ -19,6 +20,25 @@ function ledger(extra = ""): EvidenceLedger {
 		],
 		trajectory: [{ id: "t1", kind: "trajectory", text: "old attempt -> failure -> changed proposal", source: "session", references: ["e1", "p1"] }],
 	};
+}
+
+function assistant(text: string, calls: Array<{ id: string; name: string; arguments?: Record<string, unknown> }> = [], stopReason = "toolUse"): Msg {
+	return { role: "assistant", stopReason, content: [...(text ? [{ type: "text", text }] : []), ...calls.map((call) => ({ type: "toolCall", id: call.id, name: call.name, arguments: call.arguments ?? {} }))] };
+}
+
+function productionSnapshot(userTurns: string[], requirementSummary: string, proposalText: string): EvidenceSnapshot {
+	const target = assistant(proposalText, [{ id: "c-current", name: "bash", arguments: { command: "cat queue.js" } }]);
+	const messages: Msg[] = [];
+	for (const [index, text] of userTurns.entries()) {
+		messages.push({ role: "user", content: text } as Msg);
+		if (index < userTurns.length - 1) messages.push(assistant(`acknowledged turn ${index + 1}`, [], "stop"));
+	}
+	messages.push(target);
+	return buildSnapshot({
+		kind: "proposal", target, messages, executedToolCallIds: new Set(),
+		requirements: [{ id: "BASE", summary: requirementSummary, origin: "manifest:BASE" }], manifest: true,
+		priorInterventions: [], config: defaultConfig(), secrets: [], scope: { sessionId: "offline", taskId: "user-amendments", branch: "main" },
+	});
 }
 
 test("S2 protects exact proposal and relevant units within a serialized-byte target", () => {
@@ -51,6 +71,89 @@ test("questions stay intact and expose every retained neutral source id", () => 
 	assert.match(anchor.instructions, /do not assume or rely on any other answer/i);
 	assert.match(questions[0]!.instructions, /INSUFFICIENT_EVIDENCE/);
 	assert.equal(CORRECTION_QUESTION_VERSION, "correction-v2");
+});
+
+test("production snapshot carries every later user instruction into packet selection in chronological order", () => {
+	const original = "Implement a bounded queue with a capacity of ten.";
+	const middle = "Correction: use capacity five rather than ten.";
+	const latest = "Continue with that correction and reject negative capacity values.";
+	const snapshot = productionSnapshot([original, middle, latest], "Queue operations preserve insertion order.", "Change the queue capacity from five back to ten.");
+	assert.deepEqual(snapshot.sourceUserInstructions?.map((unit) => ({ text: unit.text, transportText: unit.transportText, order: unit.order })), [
+		{ text: original, transportText: original, order: 0 },
+		{ text: middle, transportText: middle, order: 2 },
+		{ text: latest, transportText: latest, order: 4 },
+	]);
+	const value = ledgerFromSnapshot(snapshot);
+	const later = value.requirements.filter((unit) => unit.id.startsWith("user_instruction:"));
+	assert.deepEqual(later.map((unit) => unit.text), [middle, latest]);
+	assert.deepEqual(later.map((unit) => unit.at), ["000000000002", "000000000004"]);
+	const built = buildAssessmentPacket(value, { selector: "s2", softPayloadBytes: 4096, assessmentScope: { kind: "proposal", targetId: `proposal:${snapshot.target.proposalHash}` } });
+	assert.ok(built.packet.applicable_requirements.some((unit) => unit.text === middle), "the relevant middle correction reaches the wire packet");
+	assert.ok(built.packet.applicable_requirements.some((unit) => unit.text === latest), "the latest instruction is not treated as the only amendment");
+	assert.ok(Object.keys(buildCorrectionQuestions(built.packet).find((question) => question.id === "evidence_anchor")!.criteria).includes("user_instruction:0002"));
+	assert.doesNotMatch(built.serialized, /ELIDED|clipped/i);
+});
+
+test("repeated cumulative manifest text stays local while its middle amendment remains selectable", () => {
+	const base = `# Full task specification\n${"All queue operations must remain deterministic and source compatible. ".repeat(220)}`.trim();
+	const original = `Implement the task.\n\nSPECIFICATION:\n${base}`;
+	const middle = `Continue the task.\n\nSPECIFICATION:\n${base}\n\nCorrection: capacity is five, not ten.`;
+	const latest = "Continue with capacity five and reject negative values.";
+	const snapshot = productionSnapshot([original, middle, latest], base, "Set queue capacity to ten before running the check.");
+	assert.ok(snapshot.sourceUserInstructions?.[0]?.text.includes(base));
+	assert.ok(snapshot.sourceUserInstructions?.[1]?.text.includes(base), "the complete sanitized source remains local");
+	assert.equal(snapshot.sourceUserInstructions?.[1]?.transportText.includes(base), false, "the transported unit reuses exact manifest deduplication");
+	assert.deepEqual(snapshot.sourceUserInstructions?.[1]?.references, ["BASE"]);
+	const value = ledgerFromSnapshot(snapshot);
+	const middleUnit = value.requirements.find((unit) => unit.id === "user_instruction:0002")!;
+	assert.match(middleUnit.text, /Correction: capacity is five, not ten\./);
+	assert.deepEqual(middleUnit.references, ["BASE"]);
+	const built = buildAssessmentPacket(value, { selector: "s2", softPayloadBytes: 4096, assessmentScope: { kind: "proposal", targetId: `proposal:${snapshot.target.proposalHash}` } });
+	assert.ok(built.packet.applicable_requirements.some((unit) => unit.id === middleUnit.id), "the explicit middle amendment is selectable despite the cumulative BASE text");
+	assert.ok(built.packet.coverage.omitted_ids.includes("BASE"), "the large manifest source is not duplicated into the bounded packet");
+	assert.ok(built.packet.coverage.unresolved_requirement_refs.includes("BASE"), "the source link stays explicit when BASE is omitted");
+	const questions = buildCorrectionQuestions(built.packet);
+	const anchorCriteria = questions.find((question) => question.id === "evidence_anchor")!.criteria;
+	const focusCriteria = questions.find((question) => question.id === "requirement_focus")!.criteria;
+	assert.equal(middleUnit.id in anchorCriteria, false, "an instruction with an omitted source dependency cannot hard-ground a correction");
+	assert.equal(middleUnit.id in focusCriteria, true, "the incomplete unit remains visible as diagnostic requirement focus");
+	const completeUnit = value.requirements.find((unit) => unit.id === "user_instruction:0003")!;
+	assert.equal(completeUnit.id in anchorCriteria, true, "an unrelated complete retained instruction remains a valid local anchor");
+	const answer = (questionId: string, choice: string, probabilities: Record<string, number>): Answer => ({ type: "choice", questionId, choice, probabilities, confidence: probabilities[choice] ?? 0 });
+	const assessmentFor = (id: string): Assessment => ({
+		kind: "direction", ok: true, status: "UNRESOLVED",
+		answers: {
+			correction_needed: answer("correction_needed", "CORRECTION_JUSTIFIED", { CORRECTION_JUSTIFIED: .94, NO_CORRECTION_JUSTIFIED: .04, INSUFFICIENT_EVIDENCE: .02 }),
+			primary_concern: answer("primary_concern", "CONTRACT_CONTRADICTION", { CONTRACT_CONTRADICTION: .92, NONE: .08 }),
+			evidence_anchor: answer("evidence_anchor", id, { [id]: .92, NONE: .08 }),
+			requirement_focus: answer("requirement_focus", id, { [id]: .92, NONE: .08 }),
+		},
+		findings: [], notes: "", cost: { billedUsd: null, marketUsd: null, unknown: true }, usage: { requestBytes: 1, responseBytes: 1, attempts: 1 },
+		timings: { startedAt: "now", finishedAt: "now", ms: 1 }, requestId: "req", requestHash: "request", responseHash: "response", origin: "live",
+	});
+	const config = defaultConfig();
+	config.tuning.enabled = true;
+	assert.equal(decideCorrectionAssessment(assessmentFor(middleUnit.id), snapshot, config, { packet: built.packet }).apply, "none");
+	assert.equal(decideCorrectionAssessment(assessmentFor(completeUnit.id), snapshot, config, { packet: built.packet }).apply, "block");
+	assert.equal(built.serialized.includes(base), false);
+	assert.doesNotMatch(built.serialized, /ELIDED|clipped/i);
+});
+
+test("a single-user production request body is byte-identical to the frozen dev10 adapter", () => {
+	const user = { role: "user", content: "Implement the queue safely." } as Msg;
+	const target = assistant("Inspect the queue implementation.", [{ id: "c1", name: "bash", arguments: { command: "cat queue.js" } }]);
+	const snapshot = buildSnapshot({
+		kind: "proposal", target, messages: [user, target], executedToolCallIds: new Set(),
+		requirements: [{ id: "R01", summary: "The queue capacity must reject negative values.", origin: "manifest:R01" }], manifest: true,
+		priorInterventions: [], config: defaultConfig(), secrets: [], scope: { sessionId: "offline", taskId: "single-user", branch: "main" },
+	});
+	const built = buildAssessmentPacket(ledgerFromSnapshot(snapshot), { selector: "s2", softPayloadBytes: 4096, assessmentScope: { kind: "proposal", targetId: `proposal:${snapshot.target.proposalHash}` } });
+	const request = buildRequestBody({ model: "typesafe-ai/jev", state: built.packet as unknown as Record<string, unknown>, questions: buildCorrectionQuestions(built.packet) });
+	assert.equal(snapshot.scope.snapshotHash, "d49f561e7e50dd2a");
+	assert.equal(built.hash, "bee95dab6c101fb4f6025373709577e282cae99203f5213ab5398845cb752dc4");
+	assert.equal(built.serializedBytes, 849);
+	assert.equal(request.hash, "f8a11520c9dce158");
+	assert.equal(request.bytes, 4280);
 });
 
 test("a goal reference absent from the ledger remains unresolved and cannot ground a contract block", () => {
