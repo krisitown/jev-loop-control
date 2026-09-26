@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { defaultConfig } from "../src/config.ts";
 import { buildRequestBody } from "../src/jev.ts";
-import { buildAssessmentPacket, buildCompletionQuestions, buildCorrectionQuestions, decideCorrectionAssessment, evaluateCorrectionPolicy, ledgerFromSnapshot, LifecycleTracker, shouldScheduleCheckpoint, type EvidenceLedger } from "../src/supervisor-tuning.ts";
+import { buildAssessmentPacket, buildCompletionQuestions, buildCorrectionQuestions, CORRECTION_QUESTION_VERSION, decideCorrectionAssessment, evaluateCorrectionPolicy, ledgerFromSnapshot, LifecycleTracker, shouldScheduleCheckpoint, type EvidenceLedger } from "../src/supervisor-tuning.ts";
 import type { Answer, Assessment, EvidenceSnapshot } from "../src/types.ts";
 
 function ledger(extra = ""): EvidenceLedger {
@@ -45,8 +45,12 @@ test("questions stay intact and expose every retained neutral source id", () => 
 	assert.deepEqual(questions.map((q) => q.id), ["correction_needed", "primary_concern", "evidence_anchor", "requirement_focus"]);
 	const anchor = questions[2]!;
 	assert.ok("p1" in anchor.criteria, "the exact proposal can anchor a proposal-versus-contract concern");
+	assert.ok("R-new" in anchor.criteria, "a complete retained requirement can anchor its own contract contradiction");
+	assert.ok("goal" in anchor.criteria, "a fully resolved goal can be selected from the same source list");
 	assert.ok("e1" in anchor.criteria);
+	assert.match(anchor.instructions, /do not assume or rely on any other answer/i);
 	assert.match(questions[0]!.instructions, /INSUFFICIENT_EVIDENCE/);
+	assert.equal(CORRECTION_QUESTION_VERSION, "correction-v2");
 });
 
 test("a goal reference absent from the ledger remains unresolved and cannot ground a contract block", () => {
@@ -57,6 +61,8 @@ test("a goal reference absent from the ledger remains unresolved and cannot grou
 	assert.deepEqual(packet.coverage.unresolved_requirement_refs, ["absent"]);
 	const focus = buildCorrectionQuestions(packet).find((question) => question.id === "requirement_focus")!;
 	assert.equal("USER_GOAL" in focus.criteria, false);
+	const anchor = buildCorrectionQuestions(packet).find((question) => question.id === "evidence_anchor")!;
+	assert.equal("USER_GOAL" in anchor.criteria, false, "an unresolved goal is not offered through the anchor question either");
 	const result = evaluateCorrectionPolicy({
 		correction: { choice: "CORRECTION_JUSTIFIED", probabilities: { CORRECTION_JUSTIFIED: .92, NO_CORRECTION_JUSTIFIED: .05, INSUFFICIENT_EVIDENCE: .03 } },
 		concern: { choice: "CONTRACT_CONTRADICTION", probabilities: { CONTRACT_CONTRADICTION: .9, NONE: .1 } },
@@ -103,6 +109,34 @@ test("strong action requires supported grounding and a qualifying concern", () =
 	const downgraded = evaluateCorrectionPolicy(diffuseAuxiliary, profile);
 	assert.equal(downgraded.action, "soft", "ambiguous auxiliary selections cannot hard-block");
 	assert.equal(downgraded.strongGrounding, false);
+});
+
+test("a requirement anchor is grounded and guidance quotes that same supplied unit", () => {
+	const packet = buildAssessmentPacket(ledger(), { selector: "s2", softPayloadBytes: 4096, assessmentScope: { kind: "proposal", targetId: "p1" } }).packet;
+	const answer = (questionId: string, choice: string, probabilities: Record<string, number>): Answer => ({ type: "choice", questionId, choice, probabilities, confidence: probabilities[choice] ?? 0 });
+	const assessment: Assessment = {
+		kind: "direction", ok: true, status: "UNRESOLVED",
+		answers: {
+			correction_needed: answer("correction_needed", "CORRECTION_JUSTIFIED", { CORRECTION_JUSTIFIED: .92, NO_CORRECTION_JUSTIFIED: .05, INSUFFICIENT_EVIDENCE: .03 }),
+			primary_concern: answer("primary_concern", "CONTRACT_CONTRADICTION", { CONTRACT_CONTRADICTION: .9, NONE: .1 }),
+			evidence_anchor: answer("evidence_anchor", "R-new", { "R-new": .9, NONE: .1 }),
+			requirement_focus: answer("requirement_focus", "R-new", { "R-new": .9, NONE: .1 }),
+		},
+		findings: [], notes: "", cost: { billedUsd: null, marketUsd: null, unknown: true }, usage: { requestBytes: 1, responseBytes: 1, attempts: 1 },
+		timings: { startedAt: "now", finishedAt: "now", ms: 1 }, requestId: "req", requestHash: "request", responseHash: "response", origin: "live",
+	};
+	const snapshot: EvidenceSnapshot = {
+		target: { kind: "proposal", proposalHash: "hash", messageRef: "assistant:1" },
+		task: { manifest: false, requirements: [{ id: "R-new", summary: "replace old timeout only for network calls", origin: "turn:4" }], origin: "user" },
+		actorText: "Preserve required behavior", proposalText: "change all timeouts", toolCalls: [], observations: [], sourceObservations: [], priorInterventions: [], facts: [],
+		scope: { sessionId: "session", taskId: "task", branch: "main", snapshotHash: "snapshot" }, truncated: false, representation: {},
+	};
+	const config = defaultConfig();
+	config.tuning.enabled = true;
+	const decision = decideCorrectionAssessment(assessment, snapshot, config, { packet });
+	assert.equal(decision.apply, "block");
+	assert.match(decision.memo ?? "", /Source anchor \(R-new, source turn:4\): replace old timeout only for network calls/);
+	assert.equal((decision.memo ?? "").split("replace old timeout only for network calls").length - 1, 1, "one supplied requirement is not duplicated as a second invented source");
 });
 
 test("protected material that exceeds the target stays whole and reports oversize", () => {
@@ -188,8 +222,8 @@ test("B8-sized adapter resolves compact goal references before contract groundin
 test("productive proposal is not converted into a correction", () => {
 	const result = evaluateCorrectionPolicy({
 		correction: { choice: "NO_CORRECTION_JUSTIFIED", probabilities: { NO_CORRECTION_JUSTIFIED: .88, CORRECTION_JUSTIFIED: .08, INSUFFICIENT_EVIDENCE: .04 } },
-		concern: { choice: "NONE", probabilities: { NONE: .9 } }, anchor: { choice: "NONE", probabilities: { NONE: .9 } },
-		availableAnchorIds: [], availableRequirementIds: [],
+		concern: { choice: "NONE", probabilities: { NONE: .9 } }, anchor: { choice: "R-new", probabilities: { "R-new": .9, NONE: .1 } },
+		requirement: { choice: "R-new", probabilities: { "R-new": .9, NONE: .1 } }, availableAnchorIds: ["R-new"], availableRequirementIds: ["R-new"],
 	}, { softThreshold: .62, strongThreshold: .84, softMinGap: .12, strongMinGap: .24, strongConcerns: [] });
 	assert.equal(result.action, "none");
 	assert.equal(result.suppressionReason, "already_addressed");

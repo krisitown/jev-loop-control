@@ -5,6 +5,19 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
+## 0.4.0-dev.9 - 2026-09-26
+
+- Exposes each complete applicable requirement as a selectable evidence anchor,
+  while retaining observations and trajectory for diagnostic and retry concerns.
+- Exposes the user goal as an anchor only when every declared requirement source
+  reference is resolved in the packet.
+- Uses the same supplied-unit set for question options, policy grounding, source
+  lookup, and delivered guidance. This prevents a source-backed requirement
+  judgment from being suppressed solely because requirements were absent from a
+  separate anchor option list.
+- Development checkpoint only; thresholds and semantic decision rules are
+  unchanged. Live semantic and actor-continuation validation remain separate.
+
 ## 0.4.0-dev.8 - 2026-09-26
 
 - Tracks requirement IDs referenced by a compacted user goal and reports those
