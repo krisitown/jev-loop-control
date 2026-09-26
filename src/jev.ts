@@ -844,6 +844,8 @@ export function createHttpClient(options: HttpClientOptions): JevClient {
 			const requestBody = scrub(built.body);
 			const requestHash = hashBytes(requestBody);
 			const requestId = randomUUID();
+			const parsedRequest = JSON.parse(requestBody) as Record<string, unknown>;
+			const tunedSchemaV2 = isRecord(parsedRequest.state) && parsedRequest.state.schema_version === 2;
 			const responseArtifact = (outcome: ExchangeOutcome): { responseBody: string | undefined; responseHash: string } => {
 				if (outcome.responseText === undefined) {
 					return { responseBody: undefined, responseHash: "" };
@@ -856,11 +858,10 @@ export function createHttpClient(options: HttpClientOptions): JevClient {
 			// Determine if the original request exceeds limits.
 			const originalExceedsConfigured = built.bytes > options.maxRequestBytes;
 			const originalExceedsConservative = (() => {
-				const parsed = JSON.parse(requestBody);
 				const bodyBytes = Buffer.byteLength(requestBody, 'utf8');
-				const stateBytes = Buffer.byteLength(JSON.stringify(parsed.state), 'utf8');
+				const stateBytes = Buffer.byteLength(JSON.stringify(parsedRequest.state), 'utf8');
 				let maxQBytes = 0;
-				for (const [id, q] of Object.entries(parsed.questions)) {
+				for (const [id, q] of Object.entries(isRecord(parsedRequest.questions) ? parsedRequest.questions : {})) {
 					const len = Buffer.byteLength(JSON.stringify({ [id]: q }), 'utf8');
 					if (len > maxQBytes) maxQBytes = len;
 				}
@@ -877,6 +878,29 @@ export function createHttpClient(options: HttpClientOptions): JevClient {
 			let fallbackNote: string | null = null;
 
 			if (originalExceedsConfigured || originalExceedsConservative) {
+				// Tuned schema-v2 packets already performed whole-unit selection and
+				// protected their exact proposal, goal, and question instructions. The
+				// legacy fallback clips strings and may drop questions, invalidating that
+				// contract. Preserve the original artifact and leave it explicitly
+				// unchecked instead of dispatching a different assessment.
+				if (tunedSchemaV2) {
+					return finish({
+						ok: false,
+						status: "UNCHECKED",
+						answers: {},
+						findings: [],
+						notes: "UNCHECKED_CONTEXT: tuned schema-v2 request exceeds configured/conservative limits",
+						failure: { stage: "budget", message: "UNCHECKED_CONTEXT: tuned schema-v2 request exceeds configured/conservative limits" },
+						cost: { billedUsd: null, marketUsd: null, unknown: true },
+						usage: { requestBytes: built.bytes, responseBytes: 0, attempts: 0 },
+						requestId,
+						requestHash,
+						requestBody,
+						responseHash: "",
+						origin: "live",
+						partialCoverage: true,
+					});
+				}
 				// Build compact fallback packet from already-scrubbed state and exact questions.
 				const fallback = buildFallbackPacket(kind, state, questions, scrub, options.model, options.maxRequestBytes);
 				if (fallback === null) {

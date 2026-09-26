@@ -305,6 +305,33 @@ test("client: zero requests on missing key; one clipped dispatch on oversized pr
 	assert.strictEqual(parsed.state._fallback.proposal_clipped, true);
 });
 
+test("client: an oversized tuned v2 packet stays intact and unchecked with zero dispatch", async () => {
+	let calls = 0;
+	const fetchImpl = (async () => { calls += 1; return responseOf({}); }) as unknown as typeof fetch;
+	const client = createHttpClient({
+		endpoint: "https://x.test", model: "m", apiKeyEnv: "TEST_JEV_KEY", deadlineMs: 1000,
+		maxRequestBytes: 131_072, maxResponseBytes: 1000, env: { TEST_JEV_KEY: "k" }, fetchImpl,
+	});
+	const state = {
+		schema_version: 2,
+		selector_version: "s2",
+		current_proposal: { id: "proposal:p1", text: `begin-${"中".repeat(11_000)}-end`, protected: true },
+		coverage: { local: "sufficient", global: "partial", omitted_ids: ["R2"], unresolved_requirement_refs: [] },
+	};
+	const assessment = await client.assess({ kind: "direction", snapshot: SNAPSHOT as never, questions: QUESTIONS, state, signal: undefined, deadlineMs: 1000 });
+
+	assert.equal(calls, 0, "schema-v2 oversize handling never reaches the transport");
+	assert.equal(assessment.ok, false);
+	assert.equal(assessment.status, "UNCHECKED");
+	assert.equal(assessment.failure?.stage, "budget");
+	assert.match(assessment.failure?.message ?? "", /UNCHECKED_CONTEXT/);
+	assert.equal(assessment.usage.attempts, 0);
+	assert.ok(assessment.usage.requestBytes > 32_000, `fixture must cross the conservative state+question guard: ${assessment.usage.requestBytes}`);
+	const preserved = JSON.parse(assessment.requestBody ?? "{}") as { state?: typeof state; questions?: Record<string, unknown> };
+	assert.equal(preserved.state?.current_proposal.text, state.current_proposal.text, "the protected proposal is not clipped");
+	assert.deepEqual(Object.keys(preserved.questions ?? {}), QUESTIONS.map((question) => question.id), "every original question remains in the preserved artifact");
+});
+
 // ---------------------------------------------------------------- 503 retry
 
 /**

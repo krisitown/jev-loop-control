@@ -5,6 +5,24 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
+## 0.4.0-dev.8 - 2026-09-26
+
+- Tracks requirement IDs referenced by a compacted user goal and reports those
+  that are absent from the selected packet. A goal with unresolved source
+  references is no longer offered as contract grounding for a hard redirect;
+  complete retained requirements can still ground local corrections.
+- Removes compact-context placeholders from the protected goal text while
+  retaining their source dependencies as metadata. Large manifest supersets
+  remain optional and are never protected into an oversized wire packet.
+- Refuses to route an oversized tuned schema-v2 request through the legacy
+  string-clipping fallback. It preserves the exact packet and questions as an
+  unchecked artifact and performs no HTTP dispatch.
+- Offline replay of all 40 recorded batch-8 actor boundaries produced complete
+  four- or five-question requests of 20,628–24,429 bytes, with no skipped
+  checkpoints and no network calls. Hosted Jev semantics and real actor
+  continuations remain unvalidated; partial coverage cannot certify completion.
+- Development checkpoint only.
+
 ## 0.4.0-dev.7 - 2026-09-26
 
 - Prevents the tuned production adapter from invoking legacy middle-clipping
