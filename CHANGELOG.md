@@ -5,6 +5,13 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
+## 0.4.0-dev.10 - 2026-09-26
+
+- Aligns the package and lockfile version metadata so an isolated Git-package
+  installation remains clean. Production source is byte-identical to dev9.
+- Packaging-only development checkpoint; the dev9 source and validation limits
+  remain unchanged.
+
 ## 0.4.0-dev.9 - 2026-09-26
 
 - Exposes each complete applicable requirement as a selectable evidence anchor,
