@@ -5,6 +5,13 @@ code at the referenced commit, plus how far it was checked. Effectiveness claims
 belong to measured results, which are recorded separately from this file. Where an
 entry is a development milestone rather than a published release, it says so.
 
+## 0.4.0-dev.13 - 2026-09-26
+
+- Normalizes package and lockfile indentation after a fresh Git-package install
+  showed npm rewriting the dev12 version lines and leaving the checkout dirty.
+- Packaging-only development checkpoint. Production source and test behavior are
+  byte-identical to dev12.
+
 ## 0.4.0-dev.12 - 2026-09-26
 
 - Adds a real-Pi adapter regression for soft tuned guidance: the assessed tool
